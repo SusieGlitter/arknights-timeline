@@ -105,6 +105,9 @@
         return;
       }
       var atype = actionTypeName(act.actionType);
+      // 行上要带 hiddenGroup，页面才能把「这一条来自哪个隐藏组」标出来（用户口径）。
+      var group = val(act.hiddenGroup, null);
+      if (group === '') group = null;
       var base = fragPre + milliFrames(act.preDelay);
       var count = Math.max(0, Math.trunc(num(act.count, 0)));
       var interval = milliFrames(act.interval);
@@ -114,12 +117,12 @@
       if (MULTI[atype]) {
         for (var seq = 0; seq < count; seq++) {
           items.push({ time_mt: base + interval * seq, action: ai, seq: seq, kind: atype, key: key,
-            route: route, synthetic: false, use_extra_route: fromBranch, block_fragment: block });
+            route: route, synthetic: false, use_extra_route: fromBranch, block_fragment: block, hidden_group: group });
         }
         if (block) blockCounter += count;
       } else {
         items.push({ time_mt: base, action: ai, seq: 0, kind: atype, key: key, route: route,
-          synthetic: false, use_extra_route: fromBranch, block_fragment: block });
+          synthetic: false, use_extra_route: fromBranch, block_fragment: block, hidden_group: group });
         if (block) blockCounter += 1;
       }
       if (atype === 'SPAWN') {
@@ -128,13 +131,13 @@
           var step = milliFrames(PREVIEW_CURSOR_INTERVAL);
           for (var k = 0; k < PREVIEW_CURSOR_COUNT; k++) {
             items.push({ time_mt: start + step * k, action: ai, seq: count + k, kind: 'PREVIEW_CURSOR',
-              key: key, route: route, synthetic: true, use_extra_route: fromBranch, block_fragment: false });
+              key: key, route: route, synthetic: true, use_extra_route: fromBranch, block_fragment: false, hidden_group: group });
           }
         }
         if (truthy(act.autoDisplayEnemyInfo)) {
           items.push({ time_mt: base, action: ai, seq: count + PREVIEW_CURSOR_COUNT,
             kind: 'DISPLAY_ENEMY_INFO', key: key, route: route, synthetic: true,
-            use_extra_route: fromBranch, block_fragment: false });
+            use_extra_route: fromBranch, block_fragment: false, hidden_group: group });
         }
       }
     });
@@ -190,6 +193,7 @@
         drained.rows.forEach(function (row) {
           rows.push({ track: 'wave', wave: wi, fragment: fi, action: row.item.action, seq: row.item.seq,
             kind: row.item.kind, key: row.item.key, route: row.item.route, synthetic: !!row.item.synthetic,
+            hidden_group: row.item.hidden_group || null,
             time_mt: row.item.time_mt, ideal_frame: row.ideal_frame, actual_frame: row.actual_frame });
         });
         if (maxWait > 0 && (completion - waveStart) > framesOf(maxWait)) {

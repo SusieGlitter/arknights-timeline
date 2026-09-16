@@ -447,7 +447,7 @@
       // 数据文件是紧凑线格式（全部 3876 关也能塞进去），选中时按需解码。
       payload = (encoded.l && window.SpawnCodec)
         ? window.SpawnCodec.decodePayload(encoded, { keys: D.keys || [], names: D.names || [],
-                                                     version: D.version })
+                                                     groups: D.groups || [], version: D.version })
         : JSON.parse(JSON.stringify(encoded));
       payload.consumption = consumption;
       payload.queue_order = queueOrder;
@@ -561,7 +561,7 @@
         key: r.key, enemy_name: KEY_NAME[r.key] || null, wave: r.wave, fragment: r.fragment,
         action: r.action, seq: r.seq, route: r.route, route_source: 'routes',
         ideal_frame: r.ideal_frame, actual_frame: r.actual_frame, synthetic: r.synthetic,
-        hidden_group: null, confidence: 'client_js_port (已与 Python 对拍)' };
+        hidden_group: r.hidden_group || null, confidence: 'client_js_port (已与 Python 对拍)' };
     });
     var spawns = rows.filter(function (r) { return r.is_spawn; });
     return { version: D.version, level: { id: levelId, code: level.code || levelId,

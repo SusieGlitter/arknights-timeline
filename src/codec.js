@@ -32,6 +32,16 @@
     return row;
   }
 
+  //: 行上的 hidden_group 用「行号+组序号」稀疏列表带（见 export_spawn_timeline_dist.py 的 hg/hgb），
+  //: 这样紧凑格式既能标出隐藏组来源，又不用给每一行加一个字段。
+  function applyHiddenGroups(rows, pairs, groups) {
+    if (!pairs || !pairs.length) return;
+    for (var i = 0; i + 1 < pairs.length; i += 2) {
+      var row = rows[pairs[i]];
+      if (row) row.hidden_group = groups[pairs[i + 1]] || null;
+    }
+  }
+
   function decodePayload(c, tables) {
     var map = { rows: c.m[0], cols: c.m[1], cells: [] };
     var flat = c.m[2] || '';
@@ -52,6 +62,10 @@
     var frags = (c.f || []).map(function (f) {
       return { wave: f[0], fragment: f[1], start_frame: f[2], completion_frame: f[3], queue_entries: f[4] };
     });
+    var rows = (c.w || []).map(function (item) { return decodeRow(item, tables); });
+    var branchRows = (c.b || []).map(function (item) { return decodeRow(item, tables); });
+    applyHiddenGroups(rows, c.hg, tables.groups || []);
+    applyHiddenGroups(branchRows, c.hgb, tables.groups || []);
     return {
       version: tables.version,
       level: { id: c.l[0], code: c.l[1], name: c.l[2], path: c.l[3] },
@@ -62,15 +76,15 @@
       selected: { hidden_groups: [], branches: [], branch_trigger_frame: 0 },
       summary: { rows: c.n[0], spawns: c.n[1], branch_rows: c.n[2], branch_spawns: c.n[3],
                  fragments: frags },
-      rows: (c.w || []).map(function (item) { return decodeRow(item, tables); }),
-      branch_rows: (c.b || []).map(function (item) { return decodeRow(item, tables); }),
+      rows: rows,
+      branch_rows: branchRows,
       map: map,
       spawn_points: spawnPoints,
       confidence: 'dist compact payload (tools/export_spawn_timeline_dist.py)',
     };
   }
 
-  var api = { decodeRow: decodeRow, decodePayload: decodePayload, CELLS: CELLS };
+  var api = { decodeRow: decodeRow, decodePayload: decodePayload, applyHiddenGroups: applyHiddenGroups, CELLS: CELLS };
   global.SpawnCodec = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);

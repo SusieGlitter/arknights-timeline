@@ -19,14 +19,19 @@
   function rawLevelFor(level) {
     if (level.level && level.level.waves) return level.level;
     var table = window.__SPAWN_WAVES__ || {};
-    if (Object.prototype.hasOwnProperty.call(table, level.id)) return { waves: table[level.id] || [] };
-    return null;
+    if (!Object.prototype.hasOwnProperty.call(table, level.id)) return null;
+    var entry = table[level.id];
+    // 新格式 {"w": waves, "b": branches}；旧数据文件是裸 waves 数组，仍然兼容。
+    if (entry && !Array.isArray(entry)) return { waves: entry.w || [], branches: entry.b || null };
+    return { waves: entry || [], branches: null };
   }
   function wavesReady() { return !!(window.__SPAWN_WAVES__ && Object.keys(window.__SPAWN_WAVES__).length); }
   var C = window.SpawnCore;
   var S = { levels: D.levels, query: '', selected: null, data: null, groups: [], branches: [],
             branchTrigger: 0, custom: null, gates: {}, sel: new Set(), selAnchor: null,
-            rows: [], spawnNo: {} };
+            rows: [], spawnNo: {},
+            //: 分发版内置**全部** 3876 关，默认范围用 all（否则按肉鸽/活动关卡名搜会搜不到）
+            scope: 'all', onlyOptions: false, spawnOnly: false };
   //: 关卡 id -> 该关默认载荷里的 {map, spawn_points}。地图和出生点与隐藏组无关，
   //: 本地重算（隐藏组子集）时直接复用，不必把原始 mapData/routes 也塞进分发包。
   var MAP_CACHE = {};
@@ -82,21 +87,38 @@
     return String(a.code || a.id).localeCompare(String(b.code || b.id), 'zh')
       || String(a.id).localeCompare(String(b.id));
   }
+  function inScope(l, scope) {
+    var g = String((l || {}).group || 'main');
+    if (!scope || scope === 'all') return true;
+    if (scope === 'main') return g === 'main';
+    if (scope === 'obt') return g === 'main' || g.indexOf('obt') === 0;
+    return true;
+  }
   function visibleLevels() {
-    var rows = S.levels.filter(function (l) { return matchLevel(l, S.query); });
+    var rows = S.levels.filter(function (l) {
+      return matchLevel(l, S.query) && inScope(l, S.scope)
+        && (!S.onlyOptions || (l.hidden_groups || []).length || (l.branches || []).length);
+    });
     rows.sort(function (a, b) {
       return scoreOf(a, S.query) - scoreOf(b, S.query) || compareLevels(a, b);
     });
-    return rows.slice(0, 400);
+    return rows;
   }
   function variantLabel(v) {
     var text = String(v || '').trim();
     return text ? text.toUpperCase() : '原版';
   }
   function levelRowHtml(l) {
+    var badges = '';
+    if ((l.hidden_groups || []).length) {
+      badges += '<span class=badge>隐藏组 ' + l.hidden_groups.length + '</span>';
+    }
+    if ((l.branches || []).length) {
+      badges += '<span class=badge>分支 ' + l.branches.length + '</span>';
+    }
     return '<div class="row' + (l.id === S.selected ? ' on' : '') + '" data-level="' + esc(l.id) + '">'
-      + '<span class=code>' + esc(l.code) + '</span><span class=name>' + esc(l.name) + '</span>'
-      + '<span class=id>' + esc(l.id) + '</span></div>';
+      + '<span class=code>' + esc(l.code || l.id) + '</span><span class=name>' + esc(l.name || '') + '</span>'
+      + badges + '<span class=id>' + esc(l.id) + '</span></div>';
   }
   /* 同一关的多个版本（肉鸽 DLC / 轮换替换文件）显示成一行，版本用 chip 切换。 */
   function variantRowHtml(group) {
@@ -114,7 +136,7 @@
   function renderLevels() {
     var box = $('list');
     var rows = visibleLevels();
-    var html = '', index = 0;
+    var html = '', index = 0, chapter = null;
     while (index < rows.length) {
       var base = rows[index].base || rows[index].id;
       var group = [];
@@ -122,10 +144,16 @@
         group.push(rows[index]);
         index += 1;
       }
+      var ch = chapterOf(group[0]);
+      if (ch !== chapter) {
+        chapter = ch;
+        html += '<div class=chapter>' + (ch === 999 ? '其它' : '第 ' + ch + ' 章') + '</div>';
+      }
+      // 用户口径：同一关的多个版本（肉鸽 DLC / 轮换）各占一行，靠文件名（id）区分，不做 chip。
       for (var k = 0; k < group.length; k++) html += levelRowHtml(group[k]);
     }
     box.innerHTML = html || '<div class=empty>没有匹配的关卡</div>';
-    $('count').textContent = rows.length + ' / ' + S.levels.length + ' 关（内置解包配置）';
+    $('count').textContent = rows.length + ' / ' + S.levels.length + ' 关（范围：' + S.scope + '）';
     Array.prototype.forEach.call(box.querySelectorAll('[data-level]'), function (n) {
       n.onclick = function () { select(n.dataset.level); };
     });
@@ -207,6 +235,7 @@
      所以点击选择 / Ctrl / Shift 多选 / 地图打点的钩子都不用改。 */
   function timelineHtml(data) {
     var rows = (data.rows || []).concat(data.branch_rows || []);
+    if (S.spawnOnly) rows = rows.filter(function (r) { return r && r.is_spawn; });
     var gates = {};
     ((data && data.wave_gates) || []).forEach(function (g) { gates[g.wave] = g; });
     var frags = ((data.summary || {}).fragments || []).filter(function (f) { return f.fragment !== null; });
@@ -432,8 +461,7 @@
     if (!encoded && S.branches.length) {
       // 分支波次的触发帧是运行时的：分发版只预计算「全开 + 触发帧 0/300」这几种组合，
       // 其余组合本地算不了，如实说明，不假装分支行已经算过。
-      notice = '分支组合未预计算（触发帧是运行时的，见 docs/02-knowledge/spawn-schedule.md §9e）：'
-        + '当前只显示常规波次。';
+      notice = '本关没有可用的分支定义（spawn-waves.js 缺 branches），只显示常规波次。';
     }
     if (!encoded) {
       try {
@@ -563,15 +591,51 @@
         ideal_frame: r.ideal_frame, actual_frame: r.actual_frame, synthetic: r.synthetic,
         hidden_group: r.hidden_group || null, confidence: 'client_js_port (已与 Python 对拍)' };
     });
-    var spawns = rows.filter(function (r) { return r.is_spawn; });
+    // 分支轨：任意子集 + 任意触发帧现算（core.js:scheduleBranches，与 Python 逐条对拍）
+    var branchRows = [];
+    if ((S.branches || []).length) {
+      if (!lv.branches) {
+        notice = (notice ? notice + ' ' : '')
+          + '本关没有分支定义（spawn-waves.js 缺 branches），只显示常规波次。';
+      } else {
+        var bsch = C.scheduleBranches(lv, { consumption: consumption, queue_order: queueOrder,
+          enabled_hidden_groups: S.groups, branches: S.branches,
+          branch_trigger_frame: S.branchTrigger });
+        branchRows = bsch.rows.map(function (r) {
+          return { track: 'branch', track_rank: 1, branch: r.branch, phase: r.phase,
+            kind: r.kind, is_spawn: r.kind === 'SPAWN', key: r.key,
+            enemy_name: KEY_NAME[r.key] || null, wave: null, fragment: null,
+            action: r.action, seq: r.seq, route: r.route, route_source: 'extraRoutes',
+            ideal_frame: r.ideal_frame, actual_frame: r.actual_frame, synthetic: r.synthetic,
+            hidden_group: r.hidden_group || null, config_frame: r.config_frame,
+            confidence: 'candidate (trigger frame is runtime)' };
+        });
+      }
+    }
+    // 与 Python payload 同一排序键（track_rank → actual_frame → wave/fragment/phase/action/seq…）
+    var merged = rows.concat(branchRows);
+    merged.sort(function (a, b) {
+      return (a.track_rank - b.track_rank) || (a.actual_frame - b.actual_frame)
+        || ((a.wave || 0) - (b.wave || 0))
+        || (((a.fragment === null || a.fragment === undefined) ? -1 : a.fragment)
+            - ((b.fragment === null || b.fragment === undefined) ? -1 : b.fragment))
+        || ((a.phase || 0) - (b.phase || 0)) || ((a.action || 0) - (b.action || 0))
+        || ((a.seq || 0) - (b.seq || 0))
+        || String(a.kind || '').localeCompare(String(b.kind || ''))
+        || String(a.key || '').localeCompare(String(b.key || ''));
+    });
+    var spawns = merged.filter(function (r) { return r.is_spawn; });
+    var waveSpawns = rows.filter(function (r) { return r.is_spawn; }).length;
     return { version: D.version, level: { id: levelId, code: level.code || levelId,
       name: level.name || '', path: level.path || '(本地文件)' },
       consumption: consumption, queue_order: queueOrder, selected: { hidden_groups: S.groups },
       options: level.options || { hidden_groups: [], branches: [] },
-      summary: { rows: rows.length, spawns: spawns.length, branch_rows: 0,
+      // 与 Python payload 同口径：rows/spawns 只数波次轨，分支轨单列 branch_rows/branch_spawns
+      summary: { rows: rows.length, spawns: waveSpawns,
+        branch_rows: branchRows.length, branch_spawns: spawns.length - waveSpawns,
         first_spawn: spawns[0] || null, last_spawn: spawns[spawns.length - 1] || null,
         fragments: sch.completions, skipped: [], skipped_count: 0 },
-      rows: rows, branch_rows: [], map: localMap(lv, levelId),
+      rows: rows, branch_rows: branchRows, map: localMap(lv, levelId),
       spawn_points: localSpawnPoints(lv, levelId) };
   }
   /* 地图/出生点与隐藏组无关：自定义文件里有 mapData 就用它，否则复用同一关
@@ -612,6 +676,15 @@
     if (!refreshData().levels.length) return;
     if (!window.SpawnCore) return;
     $('search').oninput = function () { S.query = $('search').value; renderLevels(); };
+    var scope = $('scope');
+    if (scope) {
+      scope.value = S.scope;
+      scope.onchange = function () { S.scope = scope.value; renderLevels(); };
+    }
+    var onlyOpts = $('only-options');
+    if (onlyOpts) onlyOpts.onchange = function () { S.onlyOptions = !!onlyOpts.checked; renderLevels(); };
+    var spawnOnly = $('spawn-only');
+    if (spawnOnly) spawnOnly.onchange = function () { S.spawnOnly = !!spawnOnly.checked; render(); };
     $('file').onchange = function (ev) {
       var f = ev.target.files && ev.target.files[0];
       if (!f) return;

@@ -168,6 +168,57 @@
     return { rows: rows, last_actual: last };
   }
 
+  /* 分支波次轨（tools/spawn_timeline.build(branches=..., branch_trigger_frame=...) 的移植）:
+     每个选中的 branch 从触发帧开始，按 phase 顺序各自排空一条队列（动作走 extraRoutes）。
+     触发帧是运行时的（技能/脚本），所以这些行标 candidate。用户口径：任意分支子集与任意
+     触发帧都要能在页面里现算，不能只给「全开 + 触发帧 0/300」两种预计算组合。 */
+  function scheduleBranches(level, opts) {
+    opts = opts || {};
+    var consumption = opts.consumption || 'client_accumulated';
+    var enabled = opts.enabled_hidden_groups || null;
+    var trigger = Math.max(0, Math.trunc(num(opts.branch_trigger_frame, 0)));
+    var names = (opts.branches || []).map(function (n) { return String(n); });
+    var all = (level && level.branches) || {};
+    var rows = [];
+    names.forEach(function (name) {
+      var branch = null;
+      if (Array.isArray(all)) {
+        for (var bi = 0; bi < all.length; bi++) {
+          if (String((all[bi] || {}).name || bi) === name) { branch = all[bi]; break; }
+        }
+      } else {
+        branch = all[name] || null;
+      }
+      if (!branch || typeof branch !== 'object') return;
+      var cursor = trigger;
+      entries(branch.phases).forEach(function (phase, pi) {
+        var ph = (phase && typeof phase === 'object') ? phase : {};
+        var built = buildFragmentQueue(ph, { enabled_hidden_groups: enabled,
+          queue_order: opts.queue_order, enemy_delay_mt: opts.enemy_delay_mt, from_branch: true });
+        var drained = drainQueue(built.items, cursor, consumption);
+        var phasePre = framesOf(ph.preDelay);
+        var acts = entries(ph.actions);
+        drained.rows.forEach(function (row) {
+          var item = row.item;
+          var act = (item.action >= 0 && item.action < acts.length) ? acts[item.action] : null;
+          if (!act || typeof act !== 'object') act = {};
+          // config_frame 与 Python 同式：round(sec*30*seq)，不是 round(sec*30)*seq
+          var config = trigger + phasePre + framesOf(act.preDelay)
+            + Math.round(num(act.interval, 0) * HZ * num(item.seq, 0));
+          rows.push({ track: 'branch', track_rank: 1, branch: name, phase: pi,
+            kind: item.kind, key: item.key, route: item.route, route_source: 'extraRoutes',
+            action: item.action, seq: item.seq, synthetic: !!item.synthetic,
+            hidden_group: item.hidden_group || null,
+            config_frame: config, ideal_frame: row.ideal_frame, actual_frame: row.actual_frame,
+            shift_frames: row.actual_frame - config,
+            confidence: 'candidate (trigger frame is runtime)' });
+        });
+        if (drained.rows.length) cursor = drained.last_actual + 1;
+      });
+    });
+    return { rows: rows };
+  }
+
   function schedule(level, opts) {
     opts = opts || {};
     var consumption = opts.consumption || 'client_accumulated';
@@ -233,7 +284,8 @@
     HZ: HZ, TYPES: TYPES, actionTypeName: actionTypeName, entries: entries, val: val,
     milliFrames: milliFrames, mtToFrames: mtToFrames, framesOf: framesOf, waitFrames: waitFrames,
     quickSort: quickSort, orderQueue: orderQueue, buildFragmentQueue: buildFragmentQueue,
-    drainQueue: drainQueue, schedule: schedule, prtsLabel: prtsLabel,
+    drainQueue: drainQueue, schedule: schedule, scheduleBranches: scheduleBranches,
+    prtsLabel: prtsLabel,
     build: function (level, opts) { return schedule(level, opts); }
   };
   global.SpawnCore = api;

@@ -19,7 +19,7 @@
 4. **点任意一行**会把该敌人的出生点画到右侧地图上，数字 = 全局第几个出生；`Ctrl` 单行切换，`Shift` 整段多选。
 5. 隐藏组 / 分支勾选框、分支触发帧、波次门（「上一波结束帧」）都可改，改完即时重算。
 6. 左侧「加载关卡 JSON」可以加载你自己的关卡配置文件。
-7. 右上角 GitHub 图标是仓库地址。
+7. 右上角 GitHub 图标是仓库地址；推送到 `main` 后由 GitHub Actions 自动发布（线上 <https://susieglitter.github.io/arknights-timeline/>）。
 
 ## 说明
 

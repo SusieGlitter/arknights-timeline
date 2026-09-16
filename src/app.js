@@ -459,9 +459,10 @@
     S.data = applyGates(payload, S.gates || {});
     render();
   }
-  /* 波次门：下一波要等这一波的怪全部离场。页面让用户填「上一波结束帧」，默认 =
-     上一波最后一条生成 + 1 帧。位移是纯平移（Python 侧对同一套算术做过等价验证），
-     所以这里按 `entry_cursor` 直接推：delta = max(0, 用户门 - (entry_cursor + 已累计位移))。 */
+  /* 波次门：下一波要等这一波的怪全部离场。页面让用户填「上一波结束帧」，默认 = 上一波末怪 + 1。
+     关键：载荷里的帧**已经按默认门值平移过**（导出时 st.build 就带默认门），所以这里只能算
+     「相对默认值的额外位移」——以前拿 entry_cursor 当基线，等于把默认位移再加一遍
+     （rogue4_b-6 末怪 9599 → 16105 就是这么来的）。 */
   function applyGates(base, userGates) {
     var out = base;
     var gates = (out.wave_gates || []).map(function (g) { return Object.assign({}, g); });
@@ -469,14 +470,20 @@
     var acc = 0, shifts = [];
     gates.forEach(function (g) {
       var typed = userGates[g.wave];
-      var target = (typed === undefined || typed === null || typed === '') ? g.frame : Number(typed);
-      if (target === null || isNaN(target)) return;
-      var delta = Math.max(0, target - (Number(g.entry_cursor || 0) + acc));
-      acc += delta;
+      var hasUser = !(typed === undefined || typed === null || typed === '');
+      var target = hasUser ? Number(typed) : Number(g.frame);
+      if (!isFinite(target)) return;
+      var baseline = Number(g.default_frame === undefined || g.default_frame === null
+        ? g.frame : g.default_frame);
+      var extra = Math.max(0, target - baseline - acc);
+      acc += extra;
       shifts.push([g.wave, acc]);
       g.frame = target;
-      g.source = (typed === undefined || typed === null || typed === '') ? 'default' : 'user';
+      g.requested_frame = hasUser ? target : null;
+      g.extra_shift = extra;
+      g.source = hasUser ? 'user' : 'default';
     });
+    if (!acc) { out.wave_gates = gates; return out; }
     var shiftOf = function (wave) {
       var d = 0;
       shifts.forEach(function (pair) { if (wave >= pair[0]) d = pair[1]; });
@@ -489,6 +496,9 @@
       if (r.ideal_frame != null) r.ideal_frame += d;
       if (r.config_frame != null) r.config_frame += d;
       if (r.gate_frame != null) r.gate_frame += d;
+    });
+    (out.branch_rows || []).forEach(function (r) {
+      if (r.gate_frame != null) r.gate_frame += acc;
     });
     var frags = ((out.summary || {}).fragments || []);
     frags.forEach(function (f) {

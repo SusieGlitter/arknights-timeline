@@ -14,6 +14,22 @@
   var FRAGMENT_HANDOFF_FRAMES = 2;       // fragment 排空 → 下一 fragment 恢复的固定帧数
   var UNMODELLED_ENTRY_FRAMES = 0;       // ARM64 定案后为 0（旧候选补偿已删）
   var USER_PINNED_HANDOFF_PER_ENTRY = 2; // user_pinned 拟合模型
+  /* `_delayToBorn` 查表（毫帧）：先精确查，查不到就把 `_b` / `_2` / `_3` 这类**变体后缀**逐层剥掉。
+     依据：关卡 `action.key` 用的是变体 id（例 `enemy_2133_shdopl_b`），而同一关的 `enemyDbRefs`
+     与 prefab 落的是 base id（`enemy_2133_shdopl`，`_DelayToBorn = 1.0`）；客户端按 key 查的是同一张
+     `m_enemyMap`，所以变体与 base 共用这个字段。不兜底的话 IS6「畸症」首怪会晚 30 帧
+     （配置 10s vs 实测 9s01f），路径预览也会晚 30 帧（实测 6s00f）。 */
+  function delayToBornMt(table, key) {
+    var k = String(key == null ? '' : key);
+    for (var i = 0; i < 8 && k; i++) {
+      if (table[k] != null) return Math.max(0, Math.trunc(num(table[k], 0)));
+      var next = k.replace(/_(?:[a-z]\d*|\d+)$/, '');
+      if (!next || next === k) break;
+      k = next;
+    }
+    return 0;
+  }
+
   var PREVIEW_CURSOR_PRE_DELAY = 3.0;    // _DealAction 0x27e3738：SPAWN 前 3s
   var PREVIEW_CURSOR_INTERVAL = 0.3;     // 预瞄游标间隔
   var PREVIEW_CURSOR_COUNT = 2;
@@ -143,8 +159,7 @@
       // 合成的 DISPLAY_ENEMY_INFO 反而继承 key（0x27e37dc），递归时会再减一次。
       var delay = 0;
       if (atype === 'SPAWN') {
-        var table = opts.enemy_delay_mt || {};
-        delay = Math.max(0, Math.trunc(num(table[key], 0)));
+        delay = delayToBornMt(opts.enemy_delay_mt || {}, key);
         if (delay) base = Math.max(base - delay, 0);
       }
       if (MULTI[atype]) {

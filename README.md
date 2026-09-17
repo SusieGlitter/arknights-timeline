@@ -25,5 +25,5 @@
 
 - 敌人 prefab 的 `_delayToBorn`（客户端 `Scheduler::_DealAction` 的 `max(t - v, 0)`）也算在内：2105 个 prefab 里 164 个非零，**1049 个关卡**的生成帧因此比不带该修正时早若干帧；0-x/1-x 全 0 不受影响。
 - 帧数由客户端配置 + 复原出来的调度算术算出（`preDelay` 累加、同刻 Mono 快排、每条目至少 1 帧、fragment 边界 2 帧）。
-- 分支触发帧与波次门的真实结束帧属于运行期，页面给的帧是候选值，行上有标注。
+- 波次门默认取「上一波全部敌人离场 + 1 帧」（离线模拟真值表；多波关因此比「末怪 + 1」更晚），页面上也可以手改；分支触发帧仍属运行期候选值，行上有标注。
 - 想复核数字：`python tools/test_dist_all_levels.py`、`python tools/test_dist_spawn_timeline.py`、`python tools/test_dist_core.py`。

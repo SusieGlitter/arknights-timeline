@@ -39,12 +39,16 @@
   function mtToFrames(mt) { return Math.max(0, Math.floor((Math.trunc(mt) + MF / 2) / MF)); }
   function framesOf(sec) { return Math.round(num(sec, 0) * HZ); }
   function waitFrames(dt) { return dt <= 0 ? 0 : Math.max(1, mtToFrames(dt)); }
-  /* 波次 preDelay 的等待帧数（客户端 <WaitForPredelay>d__15::MoveNext 0x27e9924 ->
-     AsyncUtil::WaitForFixedSeconds，下限 1 帧在 0x2504184）。第 0 波少 1 帧：根协程在装载
-     阶段已被步进过一次（SchedulerDriver::DoScheduleMain 0x27f14dc）。 */
+  /* 波次起点 = round(preDelay*30)（客户端 <WaitForPredelay>d__15::MoveNext 0x27e9924 ->
+     AsyncUtil::WaitForFixedSeconds 0x24f07ec）。带 preDelay 的波次多一次恢复点，这次恢复与
+     「最后一个合成条目」执行落在同一帧 —— 由六条实测帧钉死：0-1 预览 62 / DISPLAY 154 /
+     首怪 155，9-11 预览 180 / 190、首怪 271、第二只 512，CE-5 0/1/2。
+     见 docs/02-knowledge/spawn-schedule.md §9g-9。 */
   function waveStartDelay(wave, waveIndex) {
-    var ticks = Math.max(1, framesOf(wave.preDelay));
-    return waveIndex === 0 ? Math.max(0, ticks - 1) : ticks;
+    return framesOf(wave.preDelay);
+  }
+  function tailSyntheticOverlap(wave) {
+    return num(wave.preDelay, 0) > 0;
   }
   function truthy(node) { return !!val(node, false); }
   function actionTypeName(v) {
@@ -168,9 +172,14 @@
        再加该条自己那一帧；s16 初值 0.0。
      一条条目占的帧 = WaitForFixedSeconds(本条时间 - 上一条已执行时间)（<= 0 时为 0）
      **加上它自己那一帧**。波次起点的那一帧由 waveStartDelay 处理，这里不再有任何口径开关。 */
-  function drainQueue(items, processStart, consumption) {
+  function drainQueue(items, processStart, consumption, tailOverlap) {
     var rows = [], last = processStart - 1, prev = 0, clock = processStart;
     var stepFreeIndex = -1;
+    if (tailOverlap) {
+      for (var si = items.length - 1; si >= 0; si--) {
+        if (items[si].synthetic) { stepFreeIndex = si; break; }
+      }
+    }
     for (var qi = 0; qi < items.length; qi++) {
       var item = items[qi];
       var ideal = processStart + mtToFrames(item.time_mt);
@@ -259,11 +268,6 @@
       if (gates && gates[wi] !== undefined && gates[wi] !== null) {
         cursor = Math.max(cursor, Math.trunc(num(gates[wi], cursor)));
       }
-      // 波次起点（client 2.7.71 / 190，见 docs/02-knowledge/spawn-schedule.md §9g-8）：
-      // 第 0 波的根协程在装载阶段就被 CoroutineSimulator::StartCoroutine 当场步进一次
-      // （ARM64 0x252bec4 / 0x252bf74），它的 preDelay 等待因此少占 1 帧：
-      //   wave 0         : max(1, round(preDelay*30)) - 1
-      //   wave 1, 2, ... : max(1, round(preDelay*30))
       var waveStart = cursor + waveStartDelay(wave, wi);
       cursor = waveStart;
       var maxWait = num(wave.maxTimeWaitingForNextWave, 0);
@@ -273,7 +277,8 @@
         var fragStart = processStart + framesOf(frag.preDelay);
         var built = buildFragmentQueue(frag, {
           enabled_hidden_groups: enabled, queue_order: opts.queue_order, enemy_delay_mt: opts.enemy_delay_mt });
-        var drained = drainQueue(built.items, processStart, consumption);
+        var drained = drainQueue(built.items, processStart, consumption,
+          fi === 0 && tailSyntheticOverlap(wave));
         var lastActual = drained.last_actual;
         var completion = built.items.length
           ? (consumption === 'client_accumulated' ? lastActual + FRAGMENT_HANDOFF_FRAMES + UNMODELLED_ENTRY_FRAMES * built.items.length
@@ -322,7 +327,7 @@
   var api = {
     HZ: HZ, TYPES: TYPES, actionTypeName: actionTypeName, entries: entries, val: val,
     milliFrames: milliFrames, mtToFrames: mtToFrames, framesOf: framesOf, waitFrames: waitFrames,
-    waveStartDelay: waveStartDelay,
+    waveStartDelay: waveStartDelay, tailSyntheticOverlap: tailSyntheticOverlap,
     quickSort: quickSort, orderQueue: orderQueue, buildFragmentQueue: buildFragmentQueue,
     drainQueue: drainQueue, schedule: schedule, scheduleBranches: scheduleBranches,
     prtsLabel: prtsLabel,

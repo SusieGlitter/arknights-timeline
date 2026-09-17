@@ -90,6 +90,11 @@ autoDisplayEnemyInfo == true → 1 条 DISPLAY_ENEMY_INFO，time = max(base - de
 
 所以「同刻的两个条目」会落在**连续两帧**（CE-5 开局三条盾卫实测 0/1/2）。
 
+**负时间的条目照样占帧**：`autoPreviewRoute` 造出来的预览时间可能是**负数**
+（首条 SPAWN 比 `delayToBorn + 3s` 还早时，例：10-17 首条 SPAWN 3.0s、敌人 delay 1.0s ⇒ 预览 -1.0s）。
+客户端并不丢弃它：第一条的等待量按 `dt <= 0 → 0` 处理，但它**自己那一帧**照算，后面的条目照累计。
+10-17 实机逐帧：首怪 95（模型 94）；把负条目丢掉会算成 60 —— 差 34 帧，已被实测否掉。
+
 ### 3.3 两处固定帧数（会被误当成"误差"）
 
 * **fragment 交接 = 2 帧**：一条队列排空后，下一个 fragment 的第一条要等 2 帧
@@ -164,6 +169,20 @@ q3 与 q2 同刻 → 不等，只吃 q2 的 +1 帧 → 155。
 **实机（演习，逐帧内存采集）：首怪 = 110**（模型 109，差 1 帧）。不扣 `_DelayToBorn` 会算成
 154（5s04f），差 45 帧 —— 这就是"配置写着 5s、实际 3.6s 就出来"的那类关卡的真正原因。
 
+### 4.3b 10-17「坚城高墙」（`obt/main/level_main_10-15.json`）—— 负时间预览
+`wave0.preDelay=0`、frag0 `preDelay=0`，两条 `SPAWN(pre=3.0, count=3, interval=1.0, autoPreviewRoute)`
+都是 `enemy_1220_dzoms`（`_DelayToBorn = 1.0s`）⇒ 预览时间 `90000-30000-90000 = -30000`（负）。
+
+| 队列 | 条目 | 时间(mt) | 实际帧（模型） | 实机 |
+| --- | --- | --- | --- | --- |
+| q0/q1 | 合成预览 | -30000 | 0 / 1 | —（不可见） |
+| q2/q3 | 合成预览 seq2 | -21000 | 11 / 12 | — |
+| q4 | SPAWN a1#0 | 60000 | **94** | **95** |
+| q5 | SPAWN a0#0 | 60000 | **95** | **99** |
+| … | 之后每对 +30s | … | 126/127、158/159 | 127/129、159/161 |
+
+（同刻那一对的第二条实机比模型多 1~3 帧，属已记录的 candidate 容差。）
+
 ### 4.4 IS6「畸症」（`obt/roguelike/ro6/level_rogue6_b-6.json`）—— 用户报的那个矛盾
 `wave0.preDelay=0`、frag0 `preDelay=7.0`，首条可出的 SPAWN 是
 `action1: pre=3.0, key=enemy_2133_shdopl_b`。配置直读是 `7+3 = 10s`，但：
@@ -204,6 +223,7 @@ base = 300000 - 30000 = 270000 mt → 首怪 9s0xf，合成预览 = 270000-90000
 | 把 `interval` 当成"每条间隔帧数" | 第 n 条 = `round(interval*30*1000)*n` 毫帧后再取整 |
 | 认为同刻条目顺序 = 文件序 | 客户端用的 `List<T>.Sort`（Mono introsort 变体），等键会交换 |
 | 忘了每条自己那 1 帧 | 每条 = 等待 + 1 帧（CE-5 0/1/2 是硬证据） |
+| 把负时间的合成预览当成不存在 | 它照样进队列、照样占帧（10-17 实测：首怪 95 vs 丢条目会算 60） |
 | 忘了 fragment 交接 2 帧 | 上一 fragment 排空后 +2 帧才是下一条 |
 | 直接读 `7s+3s=10s` | 先查 `_delayToBorn`（含变体回退），再减 |
 | 预览按配置读 count/interval | actionType==1 时客户端强制 `count=2, interval=0.3s` |
@@ -220,6 +240,7 @@ base = 300000 - 30000 = 270000 mt → 首怪 9s0xf，合成预览 = 270000-90000
 | fragment 交接 2 帧 | — | `<_DealFragment>d__122::MoveNext` `0x27eba34`（`0x27ebd30` 的 `WaitWhile(m_blockCounter>0)`） | 0-1 154/155、1-12 1464/1465 实测 | client_static_verified |
 | `PREVIEW_CURSOR` = SPAWN − 3s、+0.3s、count 强制 2 | `autoPreviewRoute` | `Scheduler::_DealAction` `0x27e3738`（−3s）与 `0x27e35a4-0x27e35c8`（覆写 count/interval） | `artifacts/client-2.7.71/il2cpp/preview-cursor-executor-evidence.json` | client_static_verified |
 | `t = max(t - _delayToBorn, 0)`（SPAWN 专用） | `action.key` → prefab `Enemy._delayToBorn` | `_DealAction` `0x27e3600 fsub` / `0x27e3604 fmax`；`_CreateEnemyItem` v7a `0x1788ecc` | `artifacts/client-2.7.71/enemy-delay-born-global.json`（2105 prefab / 164 非零） | client_static_verified |
+| 负时间合成预览仍占帧（不丢弃） | `autoPreviewRoute` | `_DealAction` 里预览时间 = `base - 3s` 可为负；消费端 `t <= s16` 只跳过等待、不跳过该条 | `artifacts/client-2.7.71/runtime/exercise-10-17-analysis.json`（模型 94 / 实测 95；丢条目会算 60） | live_verified |
 | 变体 id 用 base 的该字段 | 同关 `enemyDbRefs` 用 base id | 同一张 `m_enemyMap` 按 `action.key` 查 | 畸症实测 6s/9s；16-3 实测 110 vs 模型 109 | live_verified（2 关）/ candidate（"为什么客户端给变体复用 base"更细的链路） |
 | 波次门 = 上一波离场 + 1 | `wave.maxTimeWaitingForNextWave` | `<_DealWave>d__121` `0x27eb13c` / `0x27eb198` | `artifacts/client-2.7.71/wave-clear-frames.json`；网页"波次门"输入框 | client_static_verified + live_verified（0-2 14/14） |
 | 分支触发帧 | `branches[key].phases[]` | `Scheduler` 分支记录（运行时） | 网页分支选择 + `tools/test_branch_waves.py` | candidate（触发帧是运行时的） |

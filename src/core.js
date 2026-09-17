@@ -114,6 +114,17 @@
       var route = Math.trunc(num(act.routeIndex, 0));
       var key = String(val(act.key, '') || '');
       var block = truthy(act.blockFragment);
+      // `Scheduler::_DealAction`（ARM64 0x27e3600 fsub / 0x27e3604 fmax）：SPAWN 条目按
+      // `action.key` 查 `m_enemyMap` 的 `Enemy._delayToBorn`，做 t = max(t - v, 0)。
+      // 合成的 PREVIEW_CURSOR 动作**不继承 key**（客户端 0x27e375c 那段只写 actionType/
+      // count/interval/preDelay/routeIndex），所以它建在已经减过一次的 base 上；
+      // 合成的 DISPLAY_ENEMY_INFO 反而继承 key（0x27e37dc），递归时会再减一次。
+      var delay = 0;
+      if (atype === 'SPAWN') {
+        var table = opts.enemy_delay_mt || {};
+        delay = Math.max(0, Math.trunc(num(table[key], 0)));
+        if (delay) base = Math.max(base - delay, 0);
+      }
       if (MULTI[atype]) {
         for (var seq = 0; seq < count; seq++) {
           items.push({ time_mt: base + interval * seq, action: ai, seq: seq, kind: atype, key: key,
@@ -135,7 +146,7 @@
           }
         }
         if (truthy(act.autoDisplayEnemyInfo)) {
-          items.push({ time_mt: base, action: ai, seq: count + PREVIEW_CURSOR_COUNT,
+          items.push({ time_mt: Math.max(base - delay, 0), action: ai, seq: count + PREVIEW_CURSOR_COUNT,
             kind: 'DISPLAY_ENEMY_INFO', key: key, route: route, synthetic: true,
             use_extra_route: fromBranch, block_fragment: false, hidden_group: group });
         }
@@ -145,15 +156,31 @@
   }
 
   /* <_ExecuteActionQueue>d__17::MoveNext：每条目至少占 1 帧，后面的条目整体顺延。 */
-  function drainQueue(items, processStart, consumption) {
-    var rows = [], last = processStart - 1, prev = 0;
+  /* 按客户端顺序排空一条队列（<_ExecuteActionQueue>d__17::MoveNext, v7a 0x1796a00 的移植）：
+       等待量 = 本条时间 - 上一条【已执行】条目的时间（WaitForFixedSeconds = max(1, round(dt))），
+       再加该条自己那一帧；s16 初值 0.0。
+     waveDispatchOverlap 只表达：wave.preDelay > 0 的波次多一层 WaitForPredelay，而首条真实动作的
+     **合成同伴条目**（_DealAction 递归产生的 PREVIEW_CURSOR / DISPLAY_ENEMY_INFO）与该次波次等待
+     共用一帧，所以这一组的**最后一条**不再计自己那一帧。9-11 四条实测帧（180/190/271/512）定位置；
+     wave.preDelay == 0 的关卡退化为纯逐条口径。 */
+  function drainQueue(items, processStart, consumption, waveDispatchOverlap) {
+    var rows = [], last = processStart - 1, prev = 0, clock = processStart;
+    var stepFreeIndex = -1;
+    if (waveDispatchOverlap) {
+      for (var si = items.length - 1; si >= 0; si--) {
+        if (items[si].synthetic) { stepFreeIndex = si; break; }
+      }
+    }
     for (var qi = 0; qi < items.length; qi++) {
       var item = items[qi];
       var ideal = processStart + mtToFrames(item.time_mt);
       var actual;
       if (consumption === 'client_accumulated') {
-        actual = qi === 0 ? processStart + waitFrames(item.time_mt)
-          : last + QUEUE_ENTRY_YIELD_FRAMES + waitFrames(item.time_mt - prev);
+        var delta = item.time_mt - prev;
+        if (qi === 0) clock = processStart + waitFrames(item.time_mt);
+        else if (delta > 0) clock += waitFrames(delta);
+        actual = clock;
+        if (qi !== stepFreeIndex) clock += QUEUE_ENTRY_YIELD_FRAMES;
       } else if (consumption === 'client_cumulative' || consumption === 'user_pinned') {
         actual = qi === 0 ? processStart + waitFrames(item.time_mt)
           : last + 1 + waitFrames(item.time_mt - prev);
@@ -224,7 +251,14 @@
     var consumption = opts.consumption || 'client_accumulated';
     var enabled = opts.enabled_hidden_groups || null;
     var rows = [], completions = [], cursor = 0;
+    // 波次门（`<_DealWave>d__121` 的 `WaitWhile(_CheckWaveNotFinish)`）：门是**下界**，
+    // 默认值来自离线真值表 `artifacts/client-2.7.71/wave-clear-frames.json`（该波全部敌人
+    // 离场帧 + 1），由 build 侧写进 payload 的 wave_gates，页面与对拍都走这里。
+    var gates = opts.wave_gates || null;
     entries(level.waves).forEach(function (wave, wi) {
+      if (gates && gates[wi] !== undefined && gates[wi] !== null) {
+        cursor = Math.max(cursor, Math.trunc(num(gates[wi], cursor)));
+      }
       var waveStart = cursor + framesOf(wave.preDelay);
       cursor = waveStart;
       var maxWait = num(wave.maxTimeWaitingForNextWave, 0);
@@ -234,7 +268,11 @@
         var fragStart = processStart + framesOf(frag.preDelay);
         var built = buildFragmentQueue(frag, {
           enabled_hidden_groups: enabled, queue_order: opts.queue_order, enemy_delay_mt: opts.enemy_delay_mt });
-        var drained = drainQueue(built.items, processStart, consumption);
+        // candidate：wave.preDelay>0 时该波 fragment 0 在「合成预览条目 → 第一条真实 SPAWN」
+        // 那一跳不额外记一次 yield（实测 9-11 的 180/190/271/512 四条帧定位置；默认开，
+        // opts.wave_predelay_overlap === false 可关。见 spawn-schedule.md §9c-quater）
+        var overlap = (opts.wave_predelay_overlap !== false) && fi === 0 && framesOf(wave.preDelay) > 0;
+        var drained = drainQueue(built.items, processStart, consumption, overlap);
         var lastActual = drained.last_actual;
         var completion = built.items.length
           ? (consumption === 'client_accumulated' ? lastActual + FRAGMENT_HANDOFF_FRAMES + UNMODELLED_ENTRY_FRAMES * built.items.length

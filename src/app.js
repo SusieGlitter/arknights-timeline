@@ -29,7 +29,6 @@
   var C = window.SpawnCore;
   var S = { levels: D.levels, query: '', selected: null, data: null, groups: [], branches: [],
             branchTrigger: 0, custom: null, gates: {}, sel: new Set(), selAnchor: null,
-            waveOverlap: false,
             rows: [], spawnNo: {},
             //: 分发版内置**全部** 3876 关，默认范围用 all（否则按肉鸽/活动关卡名搜会搜不到）
             scope: 'all', onlyOptions: false, spawnOnly: false };
@@ -176,28 +175,8 @@
     }).join('') + '<label class=chk>触发帧 <input type=number id=trigger min=0 value="' + S.branchTrigger + '"></label>'
       : '<div class=none>本关没有分支波次</div>';
     html += '</div>';
-    var nz = nonzeroWavePredelay(level);
-    html += '<div class=grp><h4>波次 preDelay 首条重合（候选）</h4>';
-    html += '<label class=chk title="当某一波的 waves[].preDelay > 0 时，该波 fragment 0 的第 0→1 条条目不额外记一次 yield（与波次等待的最后一帧重合）。9-11 实测首怪 9s01f(271)，默认模型给 272；对 wave.preDelay=0 的关卡是恒等变换。证据：<_DealWave>d__121::MoveNext ARM64 0x27eacc8 @0x27eb13c/@0x27eb198">'
-      + '<input type=checkbox id=wave-overlap' + (S.waveOverlap ? ' checked' : '') + '> 首条重合'
-      + '<span class=tag>候选</span></label>';
-    html += nz.length
-      ? '<div class=muted>本关 waves[].preDelay &gt; 0 的波次：' + nz.join(', ') + '（勾选后这些波的首条条目少 1 帧）</div>'
-      : '<div class=none>本关所有 waves[].preDelay 都是 0，该候选是恒等变换</div>';
-    html += '</div>';
     html += '<div class=grp id=map-grp><div id=map-body></div></div>';
     return html;
-  }
-  // 哪些波次的 waves[].preDelay > 0（候选规则只影响这些波）。原始 waves 来自
-  // spawn-waves.js / 自定义文件，所以这里能直接看字段。
-  function nonzeroWavePredelay(level) {
-    var lv = rawLevelFor(level) || {};
-    var out = [];
-    var ws = lv.waves || [];
-    for (var i = 0; i < ws.length; i++) {
-      if (Number((ws[i] || {}).preDelay || 0) > 0) out.push('w' + i);
-    }
-    return out;
   }
   function spawnPointOf(row) {
     var table = (S.data.spawn_points || {})[row.route_source || 'routes'] || {};
@@ -438,8 +417,6 @@
       n.onchange = function () { toggleBranch(n.dataset.b, n.checked); };
     });
     var trig = $('trigger'); if (trig) trig.onchange = function () { S.branchTrigger = Math.max(0, Number(trig.value) || 0); recompute({}); };
-    var ov = $('wave-overlap');
-    if (ov) ov.onchange = function () { S.waveOverlap = !!ov.checked; recompute({}); };
     Array.prototype.forEach.call($('timeline').querySelectorAll('[data-gate]'), function (n) {
       n.onchange = function () {
         var w = String(n.dataset.gate);
@@ -619,7 +596,7 @@
     });
     var sch = C.schedule(lv, { consumption: consumption, queue_order: queueOrder,
       enemy_delay_mt: lvEntry.d || null, wave_gates: gateMap,
-      enabled_hidden_groups: S.groups, wave_predelay_overlap: S.waveOverlap });
+      enabled_hidden_groups: S.groups });
     var rows = sch.rows.map(function (r) {
       return { track: 'wave', track_rank: 0, kind: r.kind, is_spawn: r.kind === 'SPAWN',
         key: r.key, enemy_name: KEY_NAME[r.key] || null, wave: r.wave, fragment: r.fragment,

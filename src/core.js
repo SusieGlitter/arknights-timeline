@@ -39,6 +39,13 @@
   function mtToFrames(mt) { return Math.max(0, Math.floor((Math.trunc(mt) + MF / 2) / MF)); }
   function framesOf(sec) { return Math.round(num(sec, 0) * HZ); }
   function waitFrames(dt) { return dt <= 0 ? 0 : Math.max(1, mtToFrames(dt)); }
+  /* 波次 preDelay 的等待帧数（客户端 <WaitForPredelay>d__15::MoveNext 0x27e9924 ->
+     AsyncUtil::WaitForFixedSeconds，下限 1 帧在 0x2504184）。第 0 波少 1 帧：根协程在装载
+     阶段已被步进过一次（SchedulerDriver::DoScheduleMain 0x27f14dc）。 */
+  function waveStartDelay(wave, waveIndex) {
+    var ticks = Math.max(1, framesOf(wave.preDelay));
+    return waveIndex === 0 ? Math.max(0, ticks - 1) : ticks;
+  }
   function truthy(node) { return !!val(node, false); }
   function actionTypeName(v) {
     if (typeof v === 'boolean') return 'EMPTY';
@@ -159,18 +166,11 @@
   /* 按客户端顺序排空一条队列（<_ExecuteActionQueue>d__17::MoveNext, v7a 0x1796a00 的移植）：
        等待量 = 本条时间 - 上一条【已执行】条目的时间（WaitForFixedSeconds = max(1, round(dt))），
        再加该条自己那一帧；s16 初值 0.0。
-     waveDispatchOverlap 只表达：wave.preDelay > 0 的波次多一层 WaitForPredelay，而首条真实动作的
-     **合成同伴条目**（_DealAction 递归产生的 PREVIEW_CURSOR / DISPLAY_ENEMY_INFO）与该次波次等待
-     共用一帧，所以这一组的**最后一条**不再计自己那一帧。9-11 四条实测帧（180/190/271/512）定位置；
-     wave.preDelay == 0 的关卡退化为纯逐条口径。 */
-  function drainQueue(items, processStart, consumption, waveDispatchOverlap) {
+     一条条目占的帧 = WaitForFixedSeconds(本条时间 - 上一条已执行时间)（<= 0 时为 0）
+     **加上它自己那一帧**。波次起点的那一帧由 waveStartDelay 处理，这里不再有任何口径开关。 */
+  function drainQueue(items, processStart, consumption) {
     var rows = [], last = processStart - 1, prev = 0, clock = processStart;
     var stepFreeIndex = -1;
-    if (waveDispatchOverlap) {
-      for (var si = items.length - 1; si >= 0; si--) {
-        if (items[si].synthetic) { stepFreeIndex = si; break; }
-      }
-    }
     for (var qi = 0; qi < items.length; qi++) {
       var item = items[qi];
       var ideal = processStart + mtToFrames(item.time_mt);
@@ -259,7 +259,12 @@
       if (gates && gates[wi] !== undefined && gates[wi] !== null) {
         cursor = Math.max(cursor, Math.trunc(num(gates[wi], cursor)));
       }
-      var waveStart = cursor + framesOf(wave.preDelay);
+      // 波次起点（client 2.7.71 / 190，见 docs/02-knowledge/spawn-schedule.md §9g-8）：
+      // 第 0 波的根协程在装载阶段就被 CoroutineSimulator::StartCoroutine 当场步进一次
+      // （ARM64 0x252bec4 / 0x252bf74），它的 preDelay 等待因此少占 1 帧：
+      //   wave 0         : max(1, round(preDelay*30)) - 1
+      //   wave 1, 2, ... : max(1, round(preDelay*30))
+      var waveStart = cursor + waveStartDelay(wave, wi);
       cursor = waveStart;
       var maxWait = num(wave.maxTimeWaitingForNextWave, 0);
       var skippedFragments = [];
@@ -268,11 +273,7 @@
         var fragStart = processStart + framesOf(frag.preDelay);
         var built = buildFragmentQueue(frag, {
           enabled_hidden_groups: enabled, queue_order: opts.queue_order, enemy_delay_mt: opts.enemy_delay_mt });
-        // candidate：wave.preDelay>0 时该波 fragment 0 在「合成预览条目 → 第一条真实 SPAWN」
-        // 那一跳不额外记一次 yield（实测 9-11 的 180/190/271/512 四条帧定位置；默认开，
-        // opts.wave_predelay_overlap === false 可关。见 spawn-schedule.md §9c-quater）
-        var overlap = (opts.wave_predelay_overlap !== false) && fi === 0 && framesOf(wave.preDelay) > 0;
-        var drained = drainQueue(built.items, processStart, consumption, overlap);
+        var drained = drainQueue(built.items, processStart, consumption);
         var lastActual = drained.last_actual;
         var completion = built.items.length
           ? (consumption === 'client_accumulated' ? lastActual + FRAGMENT_HANDOFF_FRAMES + UNMODELLED_ENTRY_FRAMES * built.items.length
@@ -321,6 +322,7 @@
   var api = {
     HZ: HZ, TYPES: TYPES, actionTypeName: actionTypeName, entries: entries, val: val,
     milliFrames: milliFrames, mtToFrames: mtToFrames, framesOf: framesOf, waitFrames: waitFrames,
+    waveStartDelay: waveStartDelay,
     quickSort: quickSort, orderQueue: orderQueue, buildFragmentQueue: buildFragmentQueue,
     drainQueue: drainQueue, schedule: schedule, scheduleBranches: scheduleBranches,
     prtsLabel: prtsLabel,

@@ -183,6 +183,55 @@
     var sp = table[String(row.route)] || null;
     return (sp && !sp.placeholder) ? sp : null;
   }
+  /* 随机刷怪组（`actions[].randomSpawnGroupKey`）：同组只出**抽中的那一条** ——
+     客户端 `PhaseData::FetchActionsWithRandomSpawn`（0x42005cc）把落选的置 `isValid = 0`，
+     出队侧 `_ExecuteActionQueue::MoveNext`（0x27e9c00）跳过它、不占帧。本页列出全部候选并逐行
+     标注「N 选 1（候选）」；抽取算术（`UniformWithWeight` + `randomSeed`）仍是 candidate，
+     详见 spawn-schedule.md §16。 */
+  var RG_INDEX_CACHE = {};
+  function randomGroupIndex(level) {
+    if (!level) return {};
+    var key = level.id || '__';
+    if (RG_INDEX_CACHE[key]) return RG_INDEX_CACHE[key];
+    var index = {};
+    var waves = level.waves || [];
+    for (var wi = 0; wi < waves.length; wi++) {
+      var frags = waves[wi].fragments || [];
+      for (var fi = 0; fi < frags.length; fi++) {
+        var acts = frags[fi].actions || [];
+        var sizes = {};
+        var ai;
+        for (ai = 0; ai < acts.length; ai++) {
+          var g = acts[ai] && acts[ai].randomSpawnGroupKey;
+          if (g) sizes[g] = (sizes[g] || 0) + 1;
+        }
+        for (ai = 0; ai < acts.length; ai++) {
+          var g2 = acts[ai] && acts[ai].randomSpawnGroupKey;
+          if (g2) index[wi + '.' + fi + '.' + ai] = { group: g2, size: sizes[g2] };
+        }
+      }
+    }
+    RG_INDEX_CACHE[key] = index;
+    return index;
+  }
+  function applyRandomGroups(rows, level) {
+    var index = randomGroupIndex(level);
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      if (r.track === 'branch' || r.wave === null || r.wave === undefined) continue;
+      var hit = index[r.wave + '.' + r.fragment + '.' + r.action];
+      if (hit) { r.random_group = hit.group; r.random_group_size = hit.size; }
+    }
+    return rows;
+  }
+  function randomGroupTag(row) {
+    if (!row || !row.random_group) return '';
+    var size = Number(row.random_group_size || 0);
+    var title = 'randomSpawnGroupKey=' + row.random_group + '，同组 ' + size
+      + ' 条候选，客户端只出抽中的那一条（PhaseData::FetchActionsWithRandomSpawn 0x42005cc）';
+    return '<span class="tag candidate" title="' + esc(title) + '">随机组 '
+      + esc(row.random_group) + (size > 1 ? ' · ' + size + ' 选 1（候选）' : '') + '</span>';
+  }
   function rowHtml(row, index) {
     var sp = spawnPointOf(row);
     var isSpawn = !!row.is_spawn;
@@ -203,7 +252,8 @@
       + '<td>' + esc(row.enemy_name || row.key) + '</td>'
       + '<td>' + where + '</td>'
       + '<td>' + (row.route === null || row.route === undefined ? '-' : esc(row.route)) + '</td>'
-      + '<td>' + (row.hidden_group ? '<span class=tag>隐藏组 ' + esc(row.hidden_group) + '</span>' : '') + '</td>'
+      + '<td>' + (row.hidden_group ? '<span class=tag>隐藏组 ' + esc(row.hidden_group) + '</span>' : '')
+      + randomGroupTag(row) + '</td>'
       + '</tr>';
   }
   function gateRowHtml(gate) {
@@ -395,6 +445,27 @@
     });
   }
 
+  /* 随机组的摘要：本页只列候选，必须把「同组只出一条」写出来，否则会被读成怪翻倍。 */
+  function randomGroupSummary(data) {
+    var rg = data && data.random_groups;
+    var counts = (rg && rg.counts) || null;
+    var groups = 0;
+    if (counts && counts.groups) groups = counts.groups;
+    else {
+      // 行上已带 `random_group`（导出载荷自带；本地重算由 applyRandomGroups 打标）
+      var seen = {};
+      (data.rows || []).forEach(function (r) {
+        if (r && r.random_group) seen[r.wave + '.' + r.fragment + '.' + r.random_group] = 1;
+      });
+      groups = Object.keys(seen).length;
+    }
+    if (!groups) return '';
+    var seed = (rg && rg.seed !== null && rg.seed !== undefined) ? '，randomSeed ' + rg.seed : '';
+    return ' <span class="tag candidate" title="同组只出抽中的那一条（PhaseData::FetchActionsWithRandomSpawn 0x42005cc；'
+      + '落选条目 isValid=0，出队侧跳过且不占帧）。抽取算术仍是 candidate，见 spawn-schedule.md §16">随机组 '
+      + groups + ' 组 · 已列出全部候选（每组只出 1 条）' + seed + '</span>';
+  }
+
   function render() {
     var data = S.data;
     if (!data) return;
@@ -403,9 +474,11 @@
     $('options').innerHTML = optionControls(data);
     var s = data.summary || {};
     var spawns = (data.rows || []).filter(function (r) { return r.is_spawn; });
+    var rgSummary = randomGroupSummary(data);
     $('summary').innerHTML = '生成 <b>' + (s.spawns || 0) + '</b> 次'
       + (spawns.length ? ' · 首怪 ' + sf(spawns[0].actual_frame) + ' · 末怪 ' + sf(spawns[spawns.length - 1].actual_frame) : '')
-      + (data.branch_notice ? ' <span class=tag>' + esc(data.branch_notice) + '</span>' : '');
+      + (data.branch_notice ? ' <span class=tag>' + esc(data.branch_notice) + '</span>' : '')
+      + rgSummary;
     $('timeline').innerHTML = timelineHtml(data);
     bindRowSelection();
     var mapBody = $('map-body');
@@ -475,7 +548,8 @@
       // 数据文件是紧凑线格式（全部 3876 关也能塞进去），选中时按需解码。
       payload = (encoded.l && window.SpawnCodec)
         ? window.SpawnCodec.decodePayload(encoded, { keys: D.keys || [], names: D.names || [],
-                                                     groups: D.groups || [], version: D.version })
+                                                     groups: D.groups || [], version: D.version,
+                                                     rgkeys: D.rgkeys || [] })
         : JSON.parse(JSON.stringify(encoded));
       payload.consumption = consumption;
       payload.queue_order = queueOrder;
@@ -626,6 +700,8 @@
         });
       }
     }
+    // 本地重算的行没有导出时的随机组字段，按本关配置现算一遍（同一套判定）
+    applyRandomGroups(rows, lv);
     // 与 Python payload 同一排序键（track_rank → actual_frame → wave/fragment/phase/action/seq…）
     var merged = rows.concat(branchRows);
     merged.sort(function (a, b) {

@@ -118,7 +118,26 @@ autoDisplayEnemyInfo == true → 1 条 DISPLAY_ENEMY_INFO，time = max(base - de
 网页里这一列可以手填；不填时用的是离线真值表（该波所有敌人 `end`/`leak` 的最大帧 + 1）。
 `maxTimeWaitingForNextWave` 存在时，超时的 fragment 会被跳过（页面会标出来）。
 
-### 3.6 隐藏组与分支
+### 3.6 随机刷怪组（`randomSpawnGroupKey`）
+
+同一个 fragment 里，**同名 `randomSpawnGroupKey` 的那些 action 是一组候选，客户端只出抽中的那一条**：
+
+* 分组：`RandomGroupSchedulerPreprocessor::DoPreprocess`（ARM64 `0x27f8050`）只收
+  `randomSpawnGroupKey` 非空的 action，按 `(wave, fragment, groupKey)` 分组，候选各自带
+  `weight`（= `ActionData.weight`，字段 `+0x58`）。
+* 剔除：`PhaseData::FetchActionsWithRandomSpawn`（`0x42005cc`）把落选的置 `isValid = 0`
+  （字段 `+0x5e`），出队侧 `_ExecuteActionQueue::MoveNext`（`0x27e9c00`）**跳过且不占帧**
+  ⇒ 后面条目不会因为落选者而顺延。
+* 抽取：`BattleController::get_randomImp`（`0x2507170`）+ `IBattleRandom::UniformWithWeight<T>`
+  ⇒ 按 `weight` 加权均匀；随机源 `BattleRandomWrapper{ System.Random m_random }`。
+  **具体算术与 `randomSeed` 注入点仍是 candidate**，所以手算时：先按「每组只留一条」
+  把候选删到一条，再照 §2/§3 算；抽中的是哪一条要看实机（页面默认把所有候选都列出来并
+  标「N 选 1（候选）」）。
+
+例子：`rogue_1-1`（`randomSeed = 455685591`）wave0 f0 有 4 组、每组 2 条（`enemy_1003_ncbow_2`
+权重 75 / `enemy_1011_wizard` 权重 25），所以实际只出 4 只而不是 8 只。
+
+### 3.7 隐藏组与分支
 * `hiddenGroup` 没勾 → 那些 action 整条不存在，**后面的条目整体前移**（不是把时间空出来）。
 * 分支波次从**触发帧**（运行时由技能/脚本给出，网页里手填）开始，各 `phase` 顺序排空，
   路由下标是 `extraRoutes` 的**绝对下标**。触发帧不可静态得知 ⇒ 那些行标 `candidate`。
@@ -228,6 +247,7 @@ base = 300000 - 30000 = 270000 mt → 首怪 9s0xf，合成预览 = 270000-90000
 | 直接读 `7s+3s=10s` | 先查 `_delayToBorn`（含变体回退），再减 |
 | 预览按配置读 count/interval | actionType==1 时客户端强制 `count=2, interval=0.3s` |
 | 隐藏组"留空时间" | 没勾的 action 不存在，后面整体前移 |
+| 把 `randomSpawnGroupKey` 的每条候选都当成会出 | 同组只出抽中的那一条；落选条目不占帧、不影响后面顺延 |
 | 第 2 波起用配置时间当起点 | 门 = 上一波全部离场 + 1，是下界 |
 
 ## 7. 证据表（版本 2.7.71 / 190）
@@ -244,3 +264,4 @@ base = 300000 - 30000 = 270000 mt → 首怪 9s0xf，合成预览 = 270000-90000
 | 变体 id 用 base 的该字段 | 同关 `enemyDbRefs` 用 base id | 同一张 `m_enemyMap` 按 `action.key` 查 | 畸症实测 6s/9s；16-3 实测 110 vs 模型 109 | live_verified（2 关）/ candidate（"为什么客户端给变体复用 base"更细的链路） |
 | 波次门 = 上一波离场 + 1 | `wave.maxTimeWaitingForNextWave` | `<_DealWave>d__121` `0x27eb13c` / `0x27eb198` | `artifacts/client-2.7.71/wave-clear-frames.json`；网页"波次门"输入框 | client_static_verified + live_verified（0-2 14/14） |
 | 分支触发帧 | `branches[key].phases[]` | `Scheduler` 分支记录（运行时） | 网页分支选择 + `tools/test_branch_waves.py` | candidate（触发帧是运行时的） |
+| 随机组「同组只出一条」 | `actions[].randomSpawnGroupKey` / `weight` | `RandomGroupSchedulerPreprocessor::DoPreprocess` `0x27f8050`；`PhaseData::FetchActionsWithRandomSpawn` `0x42005cc`（`isValid=0`）；出队 `0x27e9c00` | 网页行标「随机组 g · N 选 1（候选）」，摘要写组数；`tools/test_random_spawn_groups.py`（41 项） | client_static_verified（分组/剔除）/ candidate（`UniformWithWeight` 内部算术与 seed 注入点） |

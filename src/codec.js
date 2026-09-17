@@ -42,6 +42,21 @@
     }
   }
 
+  /* 行上的随机刷怪组（`actions[].randomSpawnGroupKey`）同样走稀疏列表：
+   *   [行号, 组序号, 同组候选数, ...]；分支行用 `-(行号+1)` 编码（见导出器的 rg）。
+   * 客户端同组只出抽中的一条（`PhaseData::FetchActionsWithRandomSpawn` 0x42005cc 把落选的置
+   * isValid=0，出队侧 0x27e9c00 跳过且不占帧），所以页面必须写明「N 选 1（候选）」。 */
+  function applyRandomGroups(rows, branchRows, flat, keys) {
+    if (!flat || !flat.length) return;
+    for (var i = 0; i + 2 < flat.length; i += 3) {
+      var slot = Number(flat[i]);
+      var row = slot < 0 ? branchRows[-slot - 1] : rows[slot];
+      if (!row) continue;
+      row.random_group = keys[flat[i + 1]] || null;
+      row.random_group_size = flat[i + 2];
+    }
+  }
+
   function decodePayload(c, tables) {
     var map = { rows: c.m[0], cols: c.m[1], cells: [] };
     var flat = c.m[2] || '';
@@ -66,6 +81,7 @@
     var branchRows = (c.b || []).map(function (item) { return decodeRow(item, tables); });
     applyHiddenGroups(rows, c.hg, tables.groups || []);
     applyHiddenGroups(branchRows, c.hgb, tables.groups || []);
+    applyRandomGroups(rows, branchRows, c.rg, (tables && tables.rgkeys) || []);
     return {
       version: tables.version,
       level: { id: c.l[0], code: c.l[1], name: c.l[2], path: c.l[3] },
@@ -74,6 +90,8 @@
       consumption: 'client_accumulated',
       queue_order: 'mono_qsort',
       selected: { hidden_groups: [], branches: [], branch_trigger_frame: 0 },
+      random_groups: c.rgs ? { policy: c.rgs[0], seed: c.rgs[1],
+        counts: { groups: c.rgs[2], candidates: c.rgs[3], dropped: c.rgs[4] } } : null,
       summary: { rows: c.n[0], spawns: c.n[1], branch_rows: c.n[2], branch_spawns: c.n[3],
                  fragments: frags },
       rows: rows,
@@ -84,7 +102,8 @@
     };
   }
 
-  var api = { decodeRow: decodeRow, decodePayload: decodePayload, applyHiddenGroups: applyHiddenGroups, CELLS: CELLS };
+  var api = { decodeRow: decodeRow, decodePayload: decodePayload, applyHiddenGroups: applyHiddenGroups,
+              applyRandomGroups: applyRandomGroups, CELLS: CELLS };
   global.SpawnCodec = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);

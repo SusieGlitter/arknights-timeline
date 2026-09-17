@@ -122,6 +122,17 @@
       var base = fragPre + milliFrames(act.preDelay);
       var count = Math.max(0, Math.trunc(num(act.count, 0)));
       var interval = milliFrames(act.interval);
+      // `Scheduler::_DealAction`（ARM64 0x27e35a4-0x27e35c8）在 actionType == 1
+      // （PREVIEW_CURSOR）时**无条件覆写**这条动作的 count/interval：
+      //     cmp w8,#1 / b.ne <其余类型只入队一条>
+      //     mov w8,#2  -> [ActionData+0x20] = count
+      //     movk w9,#0x3e99,lsl#16 (0.3f) -> [ActionData+0x28] = interval
+      // 配置里的这两列只是模板默认值（2-7 w0 f0 a2 写的是 count=1/interval=1.0），
+      // 照配置读会少一条队列条目，把该 fragment 后面的事件全部推早 1 帧。
+      if (atype === 'PREVIEW_CURSOR') {
+        count = PREVIEW_CURSOR_COUNT;
+        interval = milliFrames(PREVIEW_CURSOR_INTERVAL);
+      }
       var route = Math.trunc(num(act.routeIndex, 0));
       var key = String(val(act.key, '') || '');
       var block = truthy(act.blockFragment);

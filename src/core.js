@@ -11,6 +11,11 @@
   'use strict';
   var HZ = 30, MF = 1000;
   var QUEUE_ENTRY_YIELD_FRAMES = 1;      // <_ExecuteActionQueue>d__17 每条目执行后 yield 一次
+  //: 需要 `key` 指向预置单位别名的动作类型；别名解析不到（空 key / 关卡里没有这个别名）时，
+  //: 客户端那一条在出队侧被跳过 —— 等待照算、**不占执行帧**。
+  //: 实机口径（用户 2026-09-18）：离域检查 `t1/t2` 随机组里「不生成宝箱」的那一条不占帧，
+  //: `trap_223_dynbox#N` 那一条占 1 帧，整条时间轴因此差 1 帧。
+  var PREDEFINE_ACTIONS = ['ACTIVATE_PREDEFINED', 'WITHDRAW_PREDEFINED', 'TRIGGER_PREDEFINED'];
   var FRAGMENT_HANDOFF_FRAMES = 2;       // fragment 排空 → 下一 fragment 恢复的固定帧数
   var UNMODELLED_ENTRY_FRAMES = 0;       // ARM64 定案后为 0（旧候选补偿已删）
   var USER_PINNED_HANDOFF_PER_ENTRY = 2; // user_pinned 拟合模型
@@ -239,6 +244,7 @@
     opts = opts || {};
     var enabled = opts.enabled_hidden_groups || null;
     var dropped = opts.dropped_actions || null;
+    var aliases = opts.predefine_aliases || null;
     var fromBranch = !!opts.from_branch;
     var fragPre = milliFrames(fragment.preDelay);
     var items = [], blockCounter = 0, skipped = [];
@@ -275,6 +281,13 @@
       var route = Math.trunc(num(act.routeIndex, 0));
       var key = String(val(act.key, '') || '');
       var block = truthy(act.blockFragment);
+      // 空 key 动作不占执行帧（有别名表时一并判「别名是否存在」）。
+      var noFrameReason = null;
+      if (atype === 'EMPTY') noFrameReason = 'empty_action';
+      else if (PREDEFINE_ACTIONS.indexOf(atype) >= 0 && !key) {
+        // 「别名存在但关卡表里查不到」没有实测证据 -> 保持旧行为（占 1 帧），见文档 candidate。
+        noFrameReason = 'predefine_alias_empty';
+      }
       // `Scheduler::_DealAction`（ARM64 0x27e3600 fsub / 0x27e3604 fmax）：SPAWN 条目按
       // `action.key` 查 `m_enemyMap` 的 `Enemy._delayToBorn`，做 t = max(t - v, 0)。
       // 这条 fsub 只落在 **SPAWN 分支**（0x27e35a0 cbz w8,#0x27e35cc）；其余 actionType
@@ -296,7 +309,8 @@
         if (block) blockCounter += count;
       } else {
         items.push({ time_mt: base, action: ai, seq: 0, kind: atype, key: key, route: route,
-          synthetic: false, use_extra_route: fromBranch, block_fragment: block, hidden_group: group });
+          synthetic: false, use_extra_route: fromBranch, block_fragment: block, hidden_group: group,
+          no_frame: !!noFrameReason, no_frame_reason: noFrameReason });
         if (block) blockCounter += 1;
       }
       if (atype === 'SPAWN') {
@@ -337,6 +351,19 @@
       var item = items[qi];
       var ideal = processStart + mtToFrames(item.time_mt);
       var actual;
+      if (item.no_frame) {
+        // 别名解析不到的条目：**等待照算**（客户端在同一帧内跳过执行，但到点之前照样等），
+        // 只是不加「执行协程让出的那一帧」。
+        var deltaNf = item.time_mt - prev;
+        if (qi === 0) clock = processStart + waitFrames(item.time_mt);
+        else if (deltaNf > 0) clock += waitFrames(deltaNf);
+        actual = clock;
+        prev = item.time_mt;
+        last = actual;
+        rows.push({ queue_index: qi, item: item, ideal_frame: ideal, actual_frame: actual,
+          shift_frames: actual - ideal, no_frame: true });
+        continue;
+      }
       if (consumption === 'client_accumulated') {
         var delta = item.time_mt - prev;
         if (qi === 0) clock = processStart + waitFrames(item.time_mt);
@@ -468,13 +495,42 @@
     var rows = [], completions = [], cursor = 0;
     // 分发行要显示「首怪 配置 X → 实际 Y」（与本地页同一句话），所以这里也把字面配置帧带上。
     var cfg = configTimeline(level);
-    // 波次门（`<_DealWave>d__121` 的 `WaitWhile(_CheckWaveNotFinish)`）：门是**下界**，
-    // 默认值来自离线真值表 `artifacts/client-2.7.71/wave-clear-frames.json`（该波全部敌人
-    // 离场帧 + 1），由 build 侧写进 payload 的 wave_gates，页面与对拍都走这里。
+    // 波次门（`<_DealWave>d__121` 的 `WaitWhile(_CheckWaveNotFinish)`）：门是**下界**。
+    // 默认值必须**在本次现算里推**，与 Python `spawn_timeline.build` 同一式子：
+    //     default = max(上一波排空游标, 上一波最后一条 SPAWN + 1, 该波全部离场帧 + 1)
+    // 旧实现直接复用默认载荷里的 `wave_gates` —— 那份是按**导出时的随机组口径（all）**算的，
+    // 页面默认口径改成 `pinned` 之后，离域检查（rogue5_5-2_dlc2）的第 2 波被按 `all` 的
+    // 门值 7 卡住，而正确值是 2：首怪 2 → 7，整关往后偏 5 帧（用户口径 23）。
+    // 该波全部离场帧（离线真值表 `artifacts/client-2.7.71/wave-clear-frames.json`）随
+    // 关卡一起下发（`spawn-waves.js` 的 `g`），没有的关卡就只有前两项。
     var gates = opts.wave_gates || null;
+    var clearFrames = opts.wave_clear_frames || null;
+    var gateRows = [];
+    var lastSpawnFrame = null;
     entries(level.waves).forEach(function (wave, wi) {
-      if (gates && gates[wi] !== undefined && gates[wi] !== null) {
-        cursor = Math.max(cursor, Math.trunc(num(gates[wi], cursor)));
+      var prevCursor = cursor;
+      var prevLastSpawn = lastSpawnFrame;
+      var clear = (wi > 0 && clearFrames && clearFrames[wi - 1] !== undefined
+        && clearFrames[wi - 1] !== null) ? Math.trunc(num(clearFrames[wi - 1], 0)) : null;
+      if (wi > 0) {
+        var defParts = [prevCursor];
+        if (prevLastSpawn !== null) defParts.push(prevLastSpawn + 1);
+        if (clear !== null) defParts.push(clear + 1);
+        var defaultGate = Math.max.apply(null, defParts);
+        var hasUser = !!(gates && gates[wi] !== undefined && gates[wi] !== null);
+        var frame = hasUser ? Math.trunc(num(gates[wi], prevCursor)) : defaultGate;
+        var source = hasUser ? 'user' : 'default';
+        var effective = Math.max(prevCursor, frame);
+        var defaultSource = (clear !== null && defaultGate === clear + 1) ? 'simulated_wave_end'
+          : ((prevLastSpawn === null || prevCursor > prevLastSpawn + 1) ? 'wave_end' : 'last_spawn');
+        gateRows.push({ wave: wi, frame: frame, source: source,
+          prev_last_spawn: prevLastSpawn, prev_last_spawn_plus1: (prevLastSpawn === null ? null : prevLastSpawn + 1),
+          prev_wave_end: prevCursor, default_frame: defaultGate, default_source: defaultSource,
+          simulated_wave_end: clear, simulated_gate: (clear === null ? null : clear + 1),
+          entry_cursor: prevCursor, effective_frame: effective, binding: frame >= prevCursor,
+          blocked_by_cursor: frame < prevCursor, shift_from_cursor: effective - prevCursor,
+          start_frame: effective, wave_label: '第 ' + (wi + 1) + ' 波' });
+        cursor = effective;
       }
       var waveStart = cursor + waveStartDelay(wave, wi);
       cursor = waveStart;
@@ -514,6 +570,7 @@
           });
         }
         drained.rows.forEach(function (row) {
+          if (row.item.kind === 'SPAWN') lastSpawnFrame = row.actual_frame;
           var rgi = rgByAction[row.item.action] || null;
           rows.push({ track: 'wave', wave: wi, fragment: fi, action: row.item.action, seq: row.item.seq,
             kind: row.item.kind, key: row.item.key, route: row.item.route, synthetic: !!row.item.synthetic,
@@ -542,7 +599,7 @@
       }
       cursor += framesOf(wave.postDelay);
     });
-    return { rows: rows, completions: completions };
+    return { rows: rows, completions: completions, wave_gates: gateRows };
   }
 
   /* prts.map 默认坐标：字母 = 逻辑行（A = 最下一行），数字 = 列 + 1。 */

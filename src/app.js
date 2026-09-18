@@ -170,13 +170,13 @@
       + '<div class=opt-groups>';
     html += '<div class=grp><h4>隐藏组 hiddenGroup</h4>';
     html += groups.length ? groups.map(function (g) {
-      return '<label class=chk><input type=checkbox data-g="' + esc(g.name) + '"'
+      return '<label class=chk><input type=checkbox data-group="' + esc(g.name) + '"'
         + (S.groups.indexOf(g.name) >= 0 ? ' checked' : '') + '> <code>' + esc(g.name)
         + '</code> <span class=muted>' + g.actions + ' 条 / ' + g.spawns + ' 个敌人</span></label>';
     }).join('') : '<div class=none>本关没有隐藏组</div>';
     html += '</div><div class=grp><h4>分支波次 branches</h4>';
     html += branches.length ? branches.map(function (b) {
-      return '<label class=chk><input type=checkbox data-b="' + esc(b.name) + '"'
+      return '<label class=chk><input type=checkbox data-branch="' + esc(b.name) + '"'
         + (S.branches.indexOf(b.name) >= 0 ? ' checked' : '') + '> <code>' + esc(b.name)
         + '</code> <span class=muted>' + b.phases + ' 段 / ' + b.spawns + ' 个敌人</span></label>';
     }).join('') + '<label class=chk>触发帧 <input type=number id=trigger min=0 value="' + S.branchTrigger + '"></label>'
@@ -233,6 +233,16 @@
     return html;
   }
   function spawnPointOf(row) {
+    if (!row) return null;
+    // 预置单位（宝箱 `trap_223_dynbox#N` 等）：落点写在 `level.predefines.*[].position`，
+    // 与路线无关（`ACTIVATE_PREDEFINED` 的 routeIndex 指向 E_NUM 占位路线、坐标是 (0,0)）。
+    var pp = row.predefine_position;
+    if (pp && pp.row !== null && pp.row !== undefined && pp.col !== null && pp.col !== undefined) {
+      var r = Number(pp.row), c = Number(pp.col);
+      var rowsCount = (S.data.map || {}).rows || ((S.data.map || {}).cells || []).length;
+      return { row: r, col: c, serialized_row: (rowsCount ? rowsCount - 1 - r : null), placeholder: false,
+        label: C.prtsLabel(r, c), predefine: true, alias: row.predefine_alias || row.key };
+    }
     var table = (S.data.spawn_points || {})[row.route_source || 'routes'] || {};
     var sp = table[String(row.route)] || null;
     return (sp && !sp.placeholder) ? sp : null;
@@ -366,7 +376,8 @@
       + '<td class=kind>' + esc(row.kind) + '</td>'
       + '<td><b>' + sf(row.actual_frame) + '</b> <span class=zero>' + row.actual_frame + '</span></td>'
       + '<td class="sp-cell"' + (sp ? ' data-sp="' + esc((row.route_source || 'routes') + ':' + row.route) + '"' : '')
-      + ' title="' + (sp ? '出生点 ' + esc(sp.label) + '（prts.map 坐标）' : '') + '">'
+      + ' title="' + (sp ? (sp.predefine ? '预置单位落点 ' + esc(sp.label) + '（来源 '
+          + esc(row.predefine_source || 'level.predefines') + '）' : '出生点 ' + esc(sp.label) + '（prts.map 坐标）') : '') + '">'
       + (sp ? '<b>' + esc(sp.label) + '</b>' : '-') + '</td>'
       // 敌人 / 内容：本地版（preview/spawn-times.js）一直是「名字 + 编号」两段，
       // 分发版这里跟它对齐；非 SPAWN 行本来就没有名字，只显示内容 key。
@@ -376,7 +387,12 @@
       // 用户口径：删掉「来源 / 路线」列后每行必须只剩 5 格（多一格会把最后一列挤出可视区）。
       + '<td><span class=zero>' + where + '</span>'
       + (row.hidden_group ? ' <span class=tag>隐藏组 ' + esc(row.hidden_group) + '</span>' : '')
-      + randomGroupTag(row) + delayToBornTag(row) + '</td>'
+      + randomGroupTag(row) + delayToBornTag(row)
+      // 用户口径 21（实机更正）：空 key / 别名解析不到的条目出队侧被跳过，**不占逻辑帧**。
+      + (row.occupies_frame === false
+          ? ' <span class="tag candidate" title="空 key / 别名解析不到：出队侧跳过，不占逻辑帧（原因 '
+            + esc(row.no_frame_reason || '-') + '）">不占帧</span>' : '')
+      + '</td>'
       + '</tr>';
   }
   //: 敌人 prefab 的 `_DelayToBorn`（帧）。它**不在关卡数据里**，单独存在敌人库
@@ -723,10 +739,19 @@ function hopColorOf(data, routeKey, pairIndex) {
     var paths = (data && data.route_paths) || {};
     var key = String(routeKey);
     var idx = key.indexOf(':') >= 0 ? key.split(':')[1] : key;
-    // 先精确匹配（routes:3 / extraRoutes:0），再退回数字下标（老载荷只有数字键）。
-    var raw = paths[key] || paths[idx] || null;
+    /* 先精确匹配（routes:3 / extraRoutes:0）。**只有老载荷**（键里一个冒号都没有）才退回
+       数字下标：否则 extraRoutes:0 的 idx 是 "0"，在有 60 条 routes 的关卡上会查到 routes:0
+       的折线 —— 画出来是一条不相干的路线（用户口径 19）。用 `in` 而不是真值判断：
+       `paths[key] === []`（这条路确实没折线）也算「查到了」，不能掉进下标回退。 */
+    var hasPrefixed = (data && data.__pathsPrefixed !== null && data.__pathsPrefixed !== undefined)
+      ? data.__pathsPrefixed : Object.keys(paths).some(function (k) { return k.indexOf(':') >= 0; });
+    if (data) data.__pathsPrefixed = hasPrefixed;
+    var raw = (key in paths) ? paths[key] : null;
+    if ((raw === null || raw === undefined || !raw.length) && !hasPrefixed) raw = paths[idx];
     if (!raw || !raw.length) return null;
-    // 两种形状都要认：`[[r,c], ...]`（一条折线）与 `[[[r,c], ...], ...]`（传送切好的多段）。
+    /* 两种形状都要认：`[[r,c], ...]`（一条折线）与 `[[[r,c], ...], ...]`（传送切好的多段）。
+       切段后可能出现**长度 1 的段**（起手一格就传送）：它不画线，但下面传送门小点要用它的
+       端点，所以这里不能把它过滤掉。 */
     return (typeof raw[0][0] === 'number') ? [raw] : raw;
   }
   function routePolylinesHtml(data, m, extraClass) {
@@ -1025,11 +1050,13 @@ function hopColorOf(data, routeKey, pairIndex) {
     autoFitColumns();
     bindColumnResize();
     renderMap(S.hoverPreview);
-    Array.prototype.forEach.call($('options').querySelectorAll('[data-g]'), function (n) {
-      n.onchange = function () { toggleGroup(n.dataset.g, n.checked); };
+    // 属性名与本地页（preview/spawn-times.js）保持一致：`data-group` / `data-branch`。
+    // 口径 15（分发版一比一复刻本地版）下，两份页面用同一个选择器，探针/自动化可以共用一套。
+    Array.prototype.forEach.call($('options').querySelectorAll('[data-group]'), function (n) {
+      n.onchange = function () { toggleGroup(n.dataset.group, n.checked); };
     });
-    Array.prototype.forEach.call($('options').querySelectorAll('[data-b]'), function (n) {
-      n.onchange = function () { toggleBranch(n.dataset.b, n.checked); };
+    Array.prototype.forEach.call($('options').querySelectorAll('[data-branch]'), function (n) {
+      n.onchange = function () { toggleBranch(n.dataset.branch, n.checked); };
     });
     var trig = $('trigger'); if (trig) trig.onchange = function () { S.branchTrigger = Math.max(0, Number(trig.value) || 0); recompute({}); };
     // 随机刷怪组口径下拉已按用户口径 17 删除：备注列里的「随机组 …」标签点一下轮换即可。
@@ -1244,17 +1271,18 @@ function hopColorOf(data, routeKey, pairIndex) {
     // 波次门真值：优先用当前载荷（可能是用户改过门值后的结果），否则用同一关默认载荷里
     // 缓存下来的那份。**默认口径是 `pinned`，第一次选中关卡时 `S.data` 还不存在**，
     // 没有这条兜底就会把 wave>=1 的波次整体提前（HE-EX-4 的 wave1 实测差 1839 帧）。
-    var cachedGates = (MAP_CACHE[levelId] || {}).wave_gates || null;
-    var liveGates = (S.data || {}).wave_gates || null;
-    var gateSource = (liveGates && liveGates.length) ? liveGates : (cachedGates || []);
+    /* 波次门：**只把用户手填的值当输入**，默认值交给 JS 核心在同一次现算里推
+       （`max(上一波排空, 上一波末怪+1, 该波离场帧+1)`，离场帧真值来自 `spawn-waves.js` 的 `g`）。
+       以前这里复用默认载荷里的 `wave_gates` —— 那份是按导出时的随机组口径（`all`）算的，
+       页面默认口径 `pinned` 下会把离域检查的第 2 波卡在 7 而不是 2（用户口径 23）。 */
     var gateMap = {};
-    gateSource.forEach(function (g) {
-      if (g && g.wave !== undefined && g.frame !== null && g.frame !== undefined && isFinite(Number(g.frame))) {
-        gateMap[g.wave] = Number(g.frame);
-      }
+    Object.keys(S.gates || {}).forEach(function (k) {
+      var v = S.gates[k];
+      if (v !== null && v !== undefined && isFinite(Number(v))) gateMap[k] = Number(v);
     });
     var sch = C.schedule(lv, { consumption: consumption, queue_order: queueOrder,
       enemy_delay_mt: lvEntry.d || null, wave_gates: gateMap,
+      wave_clear_frames: lvEntry.g || null,
       random_groups: { policy: S.rgPolicy || 'all', seed: levelRandomSeed(level), pins: S.rgPins || {} },
       enabled_hidden_groups: S.groups });
     var rows = sch.rows.map(function (r) {
@@ -1262,6 +1290,7 @@ function hopColorOf(data, routeKey, pairIndex) {
         key: r.key, enemy_name: KEY_NAME[r.key] || null, wave: r.wave, fragment: r.fragment,
         action: r.action, seq: r.seq, route: r.route, route_source: 'routes',
         ideal_frame: r.ideal_frame, actual_frame: r.actual_frame, synthetic: r.synthetic,
+        occupies_frame: (r.no_frame ? false : true), no_frame_reason: r.no_frame_reason || null,
         // 字面配置帧：摘要行要写「首怪 配置 X → 实际 Y」（与本地页同句），缺它就只剩 `-`。
         config_frame: (r.config_frame === undefined ? null : r.config_frame),
         config_frame_source: r.config_frame_source || 'level_config',
@@ -1288,6 +1317,7 @@ function hopColorOf(data, routeKey, pairIndex) {
             enemy_name: KEY_NAME[r.key] || null, wave: null, fragment: null,
             action: r.action, seq: r.seq, route: r.route, route_source: 'extraRoutes',
             ideal_frame: r.ideal_frame, actual_frame: r.actual_frame, synthetic: r.synthetic,
+        occupies_frame: (r.no_frame ? false : true), no_frame_reason: r.no_frame_reason || null,
             hidden_group: r.hidden_group || null, config_frame: r.config_frame,
             confidence: 'candidate (trigger frame is runtime)' };
         });
@@ -1319,7 +1349,8 @@ function hopColorOf(data, routeKey, pairIndex) {
         branch_rows: branchRows.length, branch_spawns: spawns.length - waveSpawns,
         first_spawn: spawns[0] || null, last_spawn: spawns[spawns.length - 1] || null,
         fragments: sch.completions, skipped: [], skipped_count: 0 },
-      rows: rows, branch_rows: branchRows, map: localMap(lv, levelId),
+      rows: rows, branch_rows: branchRows, wave_gates: sch.wave_gates || [],
+      map: localMap(lv, levelId),
       spawn_points: localSpawnPoints(lv, levelId),
       route_paths: localRoutePaths(lv, levelId) };
   }
@@ -1479,6 +1510,9 @@ function hopColorOf(data, routeKey, pairIndex) {
   window.SpawnApp = { boot: boot, select: select, refresh: refresh, S: S, loadFile: loadFile,
     MAP_CACHE: MAP_CACHE,
     mapBodyHtml: mapBodyHtml, mapPanelHtml: mapPanelHtml, applySelection: applySelection, spawnOrdinals: spawnOrdinals,
+    // 折线段/折线绘制暴露给无头探针：口径 19 的两条不变量（单点段要留端点小点、
+    // 精确键不许串表）在分发版上也要能被真浏览器断言，而不只是本地页。
+    routeSegmentsOf: routeSegmentsOf, routePolylinesHtml: routePolylinesHtml,
     timelineHtml: timelineHtml, matchLevel: matchLevel, prtsLabel: C.prtsLabel,
     randomGroupStats: randomGroupStats, randomGroupIndex: randomGroupIndex,
     levelRandomSeed: levelRandomSeed, rgPairs: rgPairs, rgPinsForCursor: rgPinsForCursor,

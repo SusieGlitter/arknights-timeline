@@ -74,6 +74,17 @@
       });
       spawnPoints[src] = table;
     });
+    // 移动轨迹：`c.rp = [[route, [seg_flat, ...]], ...]`，段内是平铺的 row,col
+    var routePaths = {};
+    (c.rp || []).forEach(function (item) {
+      var segs = [];
+      (item[1] || []).forEach(function (flat) {
+        var seg = [];
+        for (var i = 0; i + 1 < flat.length; i += 2) seg.push([flat[i], flat[i + 1]]);
+        if (seg.length >= 2) segs.push(seg);
+      });
+      if (segs.length) routePaths[String(item[0])] = segs;
+    });
     var frags = (c.f || []).map(function (f) {
       return { wave: f[0], fragment: f[1], start_frame: f[2], completion_frame: f[3], queue_entries: f[4] };
     });
@@ -98,6 +109,7 @@
       branch_rows: branchRows,
       map: map,
       spawn_points: spawnPoints,
+      route_paths: routePaths,
       confidence: 'dist compact payload (tools/export_spawn_timeline_dist.py)',
     };
   }

@@ -28,7 +28,7 @@
   function wavesReady() { return !!(window.__SPAWN_WAVES__ && Object.keys(window.__SPAWN_WAVES__).length); }
   var C = window.SpawnCore;
   var S = { levels: D.levels, query: '', selected: null, data: null, groups: [], branches: [],
-            rgPolicy: 'pinned', rgPins: {}, rgCursor: 0,
+            rgPolicy: 'pinned', rgPins: {}, rgCursor: 0, hoverPreview: null,
             branchTrigger: 0, custom: null, gates: {}, sel: new Set(), selAnchor: null,
             rows: [], spawnNo: {},
             //: 分发版内置**全部** 3876 关，默认范围用 all（否则按肉鸽/活动关卡名搜会搜不到）
@@ -228,13 +228,8 @@
       ? '（本关 randomSeed 为 -1：实机由服务端随机）'
       : 'randomSeed = ' + Number(seed);
     var html = '<div class=grp><h4>随机刷怪组 randomSpawnGroupKey</h4>'
-      + '<label class=chk>口径 <select id=rg-policy>'
-      + '<option value=pinned' + (S.rgPolicy === 'pinned' ? ' selected' : '') + '>抽中的那一条（默认，与实机一致）</option>'
-      + '<option value=all' + (S.rgPolicy === 'all' ? ' selected' : '') + '>全部候选（对比用，会多排几条）</option>'
-      + '<option value=seed' + (S.rgPolicy === 'seed' ? ' selected' : '') + '>按 randomSeed 抽一条（candidate）</option>'
-      + '</select> <span class=muted>' + stats.groups + ' 组 / ' + stats.candidates + ' 条候选</span></label>'
-      + '<div class=zero>' + esc(seedText) + '；机制与随机源已 static 确认，抽取算术仍是 candidate'
-      + '（详见 docs/02-knowledge/spawn-schedule.md §16）</div></div>';
+      + '<div class=muted>' + stats.groups + ' 组 / ' + stats.candidates + ' 条候选</div>'
+      + '<div class=zero>' + esc(seedText) + '</div></div>';
     return html;
   }
   function spawnPointOf(row) {
@@ -304,6 +299,16 @@
                    group: index[k].group, index: i, size: index[k].size || 1 });
       }
     });
+    return out;
+  }
+  /* 随机组标签点一下 = **这一组**轮到下一条候选（用户口径 9/17）。别的组一个字节都不动。 */
+  function nextGroupPin(pins, key, size) {
+    var k = String(key === null || key === undefined ? '' : key);
+    var n = Math.max(1, Number(size) || 1);
+    var cur = Number((pins || {})[k] || 0) || 0;
+    var out = {};
+    Object.keys(pins || {}).forEach(function (k2) { out[k2] = pins[k2]; });
+    out[k] = (cur + 1) % n;
     return out;
   }
   function rgPinsForCursor(cursor) {
@@ -609,10 +614,90 @@
     return out;
   }
 
-  function selectedMarkers(data, selected, rows, spawnNo) {
+/* 出生点圆的颜色：哈希**直接生成 rgb**（不是从调色板挑），保证白字可读 + 不同敌人色差明显。 */
+var markerHash = (function () {
+  return function (key) {
+    var s = String(key === null || key === undefined ? '' : key);
+    var h = 2166136261 >>> 0;
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619) >>> 0;
+    }
+    return h;
+  };
+})();
+function relLuminance(r, g, b) {
+  function f(c) { c /= 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); }
+  return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b);
+}
+function hslToRgb(hDeg, s, l) {
+  var c = (1 - Math.abs(2 * l - 1)) * s;
+  var hp = (((hDeg % 360) + 360) % 360) / 60;
+  var x = c * (1 - Math.abs((hp % 2) - 1));
+  var r = 0, g = 0, b = 0;
+  if (hp < 1) { r = c; g = x; } else if (hp < 2) { r = x; g = c; }
+  else if (hp < 3) { g = c; b = x; } else if (hp < 4) { g = x; b = c; }
+  else if (hp < 5) { r = x; b = c; } else { r = c; b = x; }
+  var m = l - c / 2;
+  return [Math.round((r + m) * 255), Math.round((g + m) * 255), Math.round((b + m) * 255)];
+}
+function markerColor(key) {
+  var h = markerHash(key);
+  var hue = (h % 24) * 15;
+  var sat = (58 + (h >>> 8) % 16) / 100;
+  var light = (33 + (h >>> 16) % 9) / 100;
+  var rgb = hslToRgb(hue, sat, light), r = rgb[0], g = rgb[1], b = rgb[2];
+  var guard = 0;
+  while (relLuminance(r, g, b) > 0.1833 && guard < 12) {
+    r = Math.round(r * 0.92); g = Math.round(g * 0.92); b = Math.round(b * 0.92);
+    guard += 1;
+  }
+  return 'rgb(' + r + ', ' + g + ', ' + b + ')';
+}
+
+  /*: 地图格子边长（px）：出生点圆直径就是这个值（用户口径：直径 = 格子边长）。
+      半途同步时这一行被删过 —— 没有它 `mapBodyHtml` 直接 ReferenceError，右边地图永远画不出来。 */
+  var MAP_CELL = 22;
+  /* 真实移动轨迹：`data.route_paths[route]` = 一组折线段（传送处已在导出侧断开）。 */
+  function routeSegmentsOf(data, routeKey) {
+    var paths = (data && data.route_paths) || {};
+    var key = String(routeKey);
+    var idx = key.indexOf(':') >= 0 ? key.split(':')[1] : key;
+    var raw = paths[idx] || paths[key] || null;
+    if (!raw || !raw.length) return null;
+    // 两种形状都要认：`[[r,c], ...]`（一条折线）与 `[[[r,c], ...], ...]`（传送切好的多段）。
+    return (typeof raw[0][0] === 'number') ? [raw] : raw;
+  }
+  function routePolylinesHtml(data, m, extraClass) {
+    var segs = routeSegmentsOf(data, m.route_key);
+    if (!segs || !segs.length) return '';
+    var map = (data && data.map) || {};
+    var rowCount = map.rows || ((map.cells || []).length);
+    var cell = MAP_CELL, out = [];
+    segs.forEach(function (seg) {
+      if (!seg || seg.length < 2) return;
+      var pts = seg.map(function (p) {
+        var c = Number(p[1]);
+        var r = rowCount - 1 - Number(p[0]);
+        return ((c + 0.5) * cell) + ',' + ((r + 0.5) * cell);
+      }).join(' ');
+      out.push('<polyline points="' + pts + '" fill="none" stroke="' + m.color + '"'
+        + ' stroke-width="' + Math.max(3, cell * 0.22) + '" stroke-linecap="round"'
+        + ' stroke-linejoin="round" opacity="0.9" data-mk-route="' + esc(m.route_key) + '"'
+        + ' data-mk-row="' + esc(String(m.row_index)) + '" class="' + (extraClass || '') + '"></polyline>');
+    });
+    return out.join('');
+  }
+
+  /* 出生点标记：**直径 = 格子边长**的圆；同一敌人同色（哈希），不同敌人颜色差异明显。 */
+  function selectedMarkers(data, selected, rows, spawnNo, previewIndex) {
     var list = [], map = (data && data.map) || {};
     var rowCount = map.rows || ((map.cells || []).length);
-    (selected || []).forEach(function (index) {
+    var picked = {}, wanted = [];
+    (selected || []).forEach(function (index) { picked[index] = 1; wanted.push(index); });
+    // 悬停未选中的行 = 临时把它也画出来（预览，虚线圆）。
+    if (previewIndex !== null && previewIndex !== undefined && !picked[previewIndex]) wanted.push(previewIndex);
+    wanted.forEach(function (index) {
       var row = (rows || [])[index];
       if (!row) return;
       var sp = spawnPointOf(row);
@@ -620,41 +705,140 @@
       var sr = (sp.serialized_row !== null && sp.serialized_row !== undefined)
         ? Number(sp.serialized_row) : (sp.row !== null ? rowCount - 1 - Number(sp.row) : null);
       if (sr === null) return;
+      var routeKey = (row.route_source || 'routes') + ':' + row.route;
       list.push({ r: sr, c: Number(sp.col),
                   label: (spawnNo[index] !== undefined ? String(spawnNo[index]) : '*'),
-                  frame: row.actual_frame || 0, spawn: !!row.is_spawn });
+                  frame: row.actual_frame || 0, spawn: !!row.is_spawn, key: row.key, row_index: index,
+                  route_key: routeKey, color: markerColor(row.key || routeKey),
+                  preview: !picked[index] });
     });
     list.sort(function (a, b) { return a.frame - b.frame; });
     return list;
   }
 
-  function mapBodyHtml(data, selected, rows, spawnNo) {
+  function mapBodyHtml(data, selected, rows, spawnNo, previewIndex) {
     var map = (data && data.map) || {}, cells = map.cells || [];
     var rowCount = map.rows || cells.length;
     var cols = map.cols || ((cells[0] || []).length);
     if (!rowCount || !cols) return '<div class=none>本关没有地图数据</div>';
-    var marks = {};
-    selectedMarkers(data, selected, rows, spawnNo).forEach(function (m) { marks[m.r + ',' + m.c] = m; });
-    var out = [];
+    var cell = MAP_CELL;
+    var marks = selectedMarkers(data, selected, rows, spawnNo, previewIndex);
+    var tiles = [];
     for (var r = 0; r < rowCount; r++) {
       for (var c = 0; c < cols; c++) {
         var cls = (cells[r] || [])[c] || 'ground';
-        var m2 = marks[r + ',' + c];
-        out.push('<i class="c-' + esc(cls) + (m2 ? ' has-mk' : '') + '">'
-          + (m2 ? '<b class="mk' + (m2.spawn ? '' : ' alt') + '">' + esc(m2.label) + '</b>' : '') + '</i>');
+        tiles.push('<i class="c-' + esc(cls) + '"></i>');
       }
     }
+    var dots = marks.map(function (m) {
+      return '<b class="mk-dot' + (m.spawn ? '' : ' alt') + (m.preview ? ' preview' : '')
+        + '" data-mk-route="' + esc(m.route_key) + '" data-mk-row="' + esc(String(m.row_index)) + '"'
+        + ' style="left:' + (m.c * cell) + 'px;top:' + (m.r * cell) + 'px;width:' + cell + 'px;height:' + cell
+        + 'px;background:' + m.color + '" title="' + esc((m.key || m.route_key) + ' · 出生点 ' + m.label)
+        + '">' + esc(m.label) + '</b>';
+    }).join('');
+    // 路径层在圆的下层（新路径不盖旧圆），悬停时命中的那条会被搬到 top 层压住其他敌人。
+    var lines = marks.map(function (m) { return routePolylinesHtml(data, m, 'path-base'); }).join('');
     var picked = (selected || []).length;
+    var w = cols * cell, h = rowCount * cell;
     return '<div class=map-head>地图' + (picked ? '（已选 ' + picked + ' 行）' : '') + '</div>'
-      + '<div class=spawn-map id=spawn-map style="grid-template-columns:repeat(' + cols + ',22px)">'
-      + out.join('') + '</div>'
-      + '<div class=map-legend><i class="c-start"></i>侵入点 <i class="c-end"></i>保护点'
-      + ' <span class=tag>数字=全局第几个出生</span> <span class=tag>shift/ctrl 多选</span></div>';
+      + '<div class=spawn-map id=spawn-map style="width:' + w + 'px;height:' + h + 'px">'
+      + '<div class=tile-grid style="grid-template-columns:repeat(' + cols + ',' + cell + 'px)">'
+      + tiles.join('') + '</div>'
+      + (lines ? '<svg class="path-layer path-base-layer" width="' + w + '" height="' + h
+        + '" viewBox="0 0 ' + w + ' ' + h + '">' + lines + '</svg>' : '')
+      + '<div class=mark-layer>' + dots + '</div>'
+      + (lines ? '<svg class="path-layer path-top-layer" width="' + w + '" height="' + h
+        + '" viewBox="0 0 ' + w + ' ' + h + '"></svg>' : '')
+      + '<div class=mark-top-layer></div>'
+      + '</div>';
+  }
+  function mapPanelHtml(data, selected, rows, spawnNo) {
+    return '<div class=grp id=map-grp>' + mapBodyHtml(data, selected, rows, spawnNo) + '</div>';
   }
 
-  function mapPanelHtml(data, selected, rows, spawnNo) {
-    return '<div class=grp id=map-grp><div id=map-body>'
-      + mapBodyHtml(data, selected, rows, spawnNo) + '</div></div>';
+  /* 悬停联动（与本地页同一套）：
+     * 已选条目 → 该敌人（圆 + 路径）**白色描边高亮**并**临时置顶**（路径移到圆之上的顶层 svg，
+       可遮挡其他敌人），其余路径与圆淡化；
+     * 未选条目 → 临时把它加入选择（虚线圆 + 同色路径）。
+     注意：图层元素**每次 apply 都重新查**（renderMap 会重建 innerHTML，闭包里的旧节点是游离的）。 */
+  function renderMap(previewIndex) {
+    var box = $('map-body');
+    if (!box) return;
+    box.innerHTML = mapBodyHtml(S.data, S.sel, S.rows, S.spawnNo,
+                                previewIndex === null || previewIndex === undefined ? null : previewIndex);
+    bindPathHighlight($('map-body'), $('timeline'));
+  }
+  /* 高亮的粒度是**行**（一次生成）：同一条路线上的不同刷怪时间是不同条目，悬停某一行只该亮这一行。 */
+  function markKeyOf(el) {
+    var row = el && el.dataset ? el.dataset.mkRow : null;
+    if (row !== null && row !== undefined && row !== '') return 'r' + row;
+    return el && el.dataset && el.dataset.mkRoute ? 'q' + el.dataset.mkRoute : null;
+  }
+  function rowMarkKey(tr) {
+    if (!tr || !tr.dataset || tr.dataset.sp === null || tr.dataset.sp === undefined || tr.dataset.sp === '') return null;
+    return 'r' + tr.dataset.row;
+  }
+  function bindPathHighlight(mapBox, tlBox) {
+    var apply = function (key) {
+      var base = document.querySelector('.spawn-map .path-base-layer');
+      var top = document.querySelector('.spawn-map .path-top-layer');
+      var markTop = document.querySelector('.spawn-map .mark-top-layer');
+      var mark = document.querySelector('.spawn-map .mark-layer');
+      Array.prototype.forEach.call(document.querySelectorAll('.spawn-map .mk-casing'), function (n) { n.remove(); });
+      if (top && base) {
+        Array.prototype.forEach.call(top.querySelectorAll('polyline'), function (pl) { base.appendChild(pl); });
+      }
+      // 上一次悬停搬上去的圆先放回原位（mark-layer）。
+      if (markTop && mark) {
+        Array.prototype.forEach.call(markTop.querySelectorAll('.mk-dot'), function (d) { mark.appendChild(d); });
+      }
+      Array.prototype.forEach.call(document.querySelectorAll('.spawn-map .mk-dot'), function (dot) {
+        var hit = !!key && markKeyOf(dot) === key;
+        dot.classList.toggle('hot', hit);
+        dot.classList.toggle('top', hit);
+        dot.classList.toggle('dim', !!key && !hit);
+        if (hit && markTop) markTop.appendChild(dot);
+      });
+      Array.prototype.forEach.call(document.querySelectorAll('.spawn-map .path-base-layer polyline'), function (pl) {
+        var hit = !!key && markKeyOf(pl) === key;
+        pl.setAttribute('opacity', !key ? '0.9' : (hit ? '1' : '0.12'));
+        if (hit && top) {
+          var casing = pl.cloneNode(true);
+          casing.setAttribute('class', 'mk-casing');
+          casing.setAttribute('stroke', '#fff');
+          casing.setAttribute('stroke-width', String(Number(pl.getAttribute('stroke-width') || 4) + 4));
+          casing.setAttribute('opacity', '0.95');
+          top.appendChild(casing);
+          top.appendChild(pl);
+        }
+      });
+      // 显式 block/none（CSS 默认 none，写 '' 会回落到 none，悬停时高亮层反而被藏起来）。
+      if (top) top.style.display = key ? 'block' : 'none';
+    };
+    if (mapBox && mapBox.dataset.hover !== '1') {
+      mapBox.dataset.hover = '1';
+      mapBox.addEventListener('mouseover', function (ev) {
+        var dot = ev.target && ev.target.closest ? ev.target.closest('.mk-dot') : null;
+        apply(dot ? markKeyOf(dot) : null);
+      });
+      mapBox.addEventListener('mouseleave', function () { apply(null); });
+    }
+    if (tlBox && tlBox.dataset.hover !== '1') {
+      tlBox.dataset.hover = '1';
+      tlBox.addEventListener('mouseover', function (ev) {
+        var tr = ev.target && ev.target.closest ? ev.target.closest('tr[data-row]') : null;
+        if (!tr) return;
+        var index = Number(tr.dataset.row);
+        if (!isFinite(index)) return;
+        if (!S.sel.has(index) && S.hoverPreview !== index) { S.hoverPreview = index; renderMap(index); }
+        apply(rowMarkKey(tr));
+      });
+      tlBox.addEventListener('mouseleave', function () {
+        apply(null);
+        if (S.hoverPreview !== null && S.hoverPreview !== undefined) { S.hoverPreview = null; renderMap(); }
+      });
+    }
   }
 
   function applySelection(selected, anchor, index, ctrl, shift) {
@@ -681,11 +865,11 @@
       if (tag) {
         ev.stopPropagation();
         ev.preventDefault();
-        // 用户口径：点一次轮换到下一格，跨组循环（e1 → e2 → e3 → e1）。
-        S.rgCursor = (Number(S.rgCursor || 0) + 1) % Math.max(1, rgPairs().length);
-        S.rgPins = rgPinsForCursor(S.rgCursor);
+        // 用户口径 9/17：点的是**这一组**的标签，就只轮换这一组（老实现全关共用一个游标，
+        // 点 e2 的标签会把 e1 换掉，绕一圈回到第 1 条时和初始显示对不上）。
+        S.rgPins = nextGroupPin(S.rgPins, tag.dataset.rg, tag.dataset.rgSize);
         S.rgPolicy = 'pinned';
-        recompute({});
+        refresh();
         return;
       }
       var tr = ev.target.closest && ev.target.closest('tr[data-row]');
@@ -755,8 +939,7 @@
     // 用户口径：列宽可拖动，切换关卡时自动按内容适配。
     autoFitColumns();
     bindColumnResize();
-    var mapBody = $('map-body');
-    if (mapBody) mapBody.innerHTML = mapBodyHtml(S.data, S.sel, S.rows, S.spawnNo);
+    renderMap(S.hoverPreview);
     Array.prototype.forEach.call($('options').querySelectorAll('[data-g]'), function (n) {
       n.onchange = function () { toggleGroup(n.dataset.g, n.checked); };
     });
@@ -764,9 +947,7 @@
       n.onchange = function () { toggleBranch(n.dataset.b, n.checked); };
     });
     var trig = $('trigger'); if (trig) trig.onchange = function () { S.branchTrigger = Math.max(0, Number(trig.value) || 0); recompute({}); };
-    // 随机刷怪组口径选择器：`#options` 每次 render() 都会重建，必须在这里重新绑。
-    var rgSel = $('rg-policy');
-    if (rgSel) rgSel.onchange = function () { S.rgPolicy = rgSel.value; recompute({}); };
+    // 随机刷怪组口径下拉已按用户口径 17 删除：备注列里的「随机组 …」标签点一下轮换即可。
     Array.prototype.forEach.call($('timeline').querySelectorAll('[data-gate]'), function (n) {
       n.onchange = function () {
         var w = String(n.dataset.gate);
@@ -922,8 +1103,11 @@
     var decoded = decodePayload(base);
     // `wave_gates` 一起缓存：本地重算（隐藏组子集 / 随机组口径 / 默认 pinned）必须带上
     // 同一份波次门真值，否则 wave>=1 的波次会被算早（见 computeLocally 里那段注释）。
+    // `route_paths` 和地图/出生点一样与隐藏组、随机组无关：本地现算时直接复用默认载荷里
+    // 那一份（漏了它右边地图就一根路径都没有 —— 用户报的「我看不到路径了」）。
     MAP_CACHE[key] = { map: decoded.map, spawn_points: decoded.spawn_points,
-                       wave_gates: decoded.wave_gates || null };
+                       wave_gates: decoded.wave_gates || null,
+                       route_paths: decoded.route_paths || {} };
     return MAP_CACHE[key];
   }
   function mapCells(level) {
@@ -1051,7 +1235,8 @@
         first_spawn: spawns[0] || null, last_spawn: spawns[spawns.length - 1] || null,
         fragments: sch.completions, skipped: [], skipped_count: 0 },
       rows: rows, branch_rows: branchRows, map: localMap(lv, levelId),
-      spawn_points: localSpawnPoints(lv, levelId) };
+      spawn_points: localSpawnPoints(lv, levelId),
+      route_paths: localRoutePaths(lv, levelId) };
   }
   /* 本地重算也要报「随机刷怪组」块：摘要要写 randomSeed 与口径，行上的标签也要权重。
      形状与 Python payload 一致（counts / groups / chosen_index / weights）。 */
@@ -1081,6 +1266,12 @@
     if (lv.mapData) return spawnPoints(lv);
     var cached = MAP_CACHE[levelId];
     return cached ? cached.spawn_points : {};
+  }
+  /* 真实移动轨迹：与隐藏组/随机组无关，同样复用默认载荷解码时缓存的那份。
+     自定义文件（没有预计算载荷）算不出轨迹，如实给空表 —— 页面只是不画路径。 */
+  function localRoutePaths(lv, levelId) {
+    var cached = MAP_CACHE[levelId];
+    return (cached && cached.route_paths) ? cached.route_paths : {};
   }
   function renderMessage(msg) {
     var box = $('timeline');
@@ -1194,16 +1385,19 @@
     var first = (D.levels.filter(function (l) { return l.id === D.default_level; })[0]) || D.levels[0];
     if (first) select(first.id);
   }
+  /* 重新按当前 S 里的状态渲染一次（口径/固定候选/隐藏组的改动都走它）。
+     以前只在「有隐藏组或分支」时才重算，改口径就再也刷新不了页面。 */
   function refresh() {
     if (!S.data) return;
-    if (S.groups.length || S.branches.length) recompute({});
+    recompute({});
   }
   window.SpawnApp = { boot: boot, select: select, refresh: refresh, S: S, loadFile: loadFile,
     MAP_CACHE: MAP_CACHE,
     mapBodyHtml: mapBodyHtml, mapPanelHtml: mapPanelHtml, applySelection: applySelection, spawnOrdinals: spawnOrdinals,
     timelineHtml: timelineHtml, matchLevel: matchLevel, prtsLabel: C.prtsLabel,
     randomGroupStats: randomGroupStats, randomGroupIndex: randomGroupIndex,
-    levelRandomSeed: levelRandomSeed, rgPairs: rgPairs, rgPinsForCursor: rgPinsForCursor };
+    levelRandomSeed: levelRandomSeed, rgPairs: rgPairs, rgPinsForCursor: rgPinsForCursor,
+    nextGroupPin: nextGroupPin };
   // 数据可能是 gzip+base64（见 tools/export_spawn_timeline_dist.py），
   // 那种情况下由页内 bootstrap 解压完再调 boot()。
   if (window.__SPAWN_DATA__) {

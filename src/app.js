@@ -28,6 +28,7 @@
   function wavesReady() { return !!(window.__SPAWN_WAVES__ && Object.keys(window.__SPAWN_WAVES__).length); }
   var C = window.SpawnCore;
   var S = { levels: D.levels, query: '', selected: null, data: null, groups: [], branches: [],
+            rgPolicy: 'pinned', rgPins: {}, rgCursor: 0,
             branchTrigger: 0, custom: null, gates: {}, sel: new Set(), selAnchor: null,
             rows: [], spawnNo: {},
             //: 分发版内置**全部** 3876 关，默认范围用 all（否则按肉鸽/活动关卡名搜会搜不到）
@@ -95,8 +96,10 @@
     return true;
   }
   function visibleLevels() {
+    // 用户口径（2026-09-18）：**不要**「主线 / 活动 / 其他」范围下拉，每次搜索都在全部
+    // 三千多关里找。`inScope` 保留但不再参与过滤（旧链接里可能还带 scope，不影响结果）。
     var rows = S.levels.filter(function (l) {
-      return matchLevel(l, S.query) && inScope(l, S.scope)
+      return matchLevel(l, S.query)
         && (!S.onlyOptions || (l.hidden_groups || []).length || (l.branches || []).length);
     });
     rows.sort(function (a, b) {
@@ -153,7 +156,7 @@
       for (var k = 0; k < group.length; k++) html += levelRowHtml(group[k]);
     }
     box.innerHTML = html || '<div class=empty>没有匹配的关卡</div>';
-    $('count').textContent = rows.length + ' / ' + S.levels.length + ' 关（范围：' + S.scope + '）';
+    $('count').textContent = rows.length + ' / ' + S.levels.length + ' 关（全部解包关卡）';
     Array.prototype.forEach.call(box.querySelectorAll('[data-level]'), function (n) {
       n.onclick = function () { select(n.dataset.level); };
     });
@@ -161,7 +164,11 @@
   function optionControls(level) {
     var opts = (level && level.options) || {};
     var groups = opts.hidden_groups || [], branches = opts.branches || [];
-    var html = '<div class=grp><h4>隐藏组 hiddenGroup</h4>';
+    // 用户口径：地图在左，隐藏组 / 分支波次 / 随机刷怪组在右，右侧智能换行。
+    var html = '<div class=opt-cols><div class=opt-map>'
+      + '<div class=grp id=map-grp><div id=map-body></div></div></div>'
+      + '<div class=opt-groups>';
+    html += '<div class=grp><h4>隐藏组 hiddenGroup</h4>';
     html += groups.length ? groups.map(function (g) {
       return '<label class=chk><input type=checkbox data-g="' + esc(g.name) + '"'
         + (S.groups.indexOf(g.name) >= 0 ? ' checked' : '') + '> <code>' + esc(g.name)
@@ -175,7 +182,59 @@
     }).join('') + '<label class=chk>触发帧 <input type=number id=trigger min=0 value="' + S.branchTrigger + '"></label>'
       : '<div class=none>本关没有分支波次</div>';
     html += '</div>';
-    html += '<div class=grp id=map-grp><div id=map-body></div></div>';
+    html += randomGroupControls(level);
+    html += '</div></div>';   // .opt-groups / .opt-cols
+    return html;
+  }
+  /* 随机刷怪组（用户口径：分发版也要有本地版的一切）：
+     `all` = 列出全部候选并在行上标「候选」；`seed` = 按关卡 `randomSeed` 用 JS 复刻的
+     `System.Random` + `UniformWithWeight` 抽一条、其余候选不排进队列（客户端把它们置
+     `isValid = false`，出队侧跳过且不占帧）。抽取算术仍是 candidate。 */
+  function levelRandomSeed(level) {
+    var id = (level && level.id) || S.selected;
+    var entry = (window.__SPAWN_WAVES__ || {})[id];
+    if (!entry || Array.isArray(entry)) return null;
+    return (entry.rs === undefined) ? null : entry.rs;
+  }
+  function randomGroupStats(level) {
+    // 注意：`optionControls()` 拿到的是**打包后的关卡条目**（只有 options/hidden_groups），
+    // 没有 `waves`；随机组的候选要从 `spawn-waves.js` 的原始波次里数，所以这里必须先解析出
+    // 带 waves 的关卡对象（曾经直接传打包条目 ⇒ 统计恒为 0 组 ⇒ 选择器根本不渲染）。
+    // `optionControls()` 传进来的是**解码后的载荷**（有 level.id，但没有 waves）；
+    // 也可能传打包条目（有 id 没有 waves）。两种都要能解析回 spawn-waves.js 里的原始波次。
+    var lv = (level && level.waves) ? level : null;
+    if (!lv) {
+      var id = (level && (level.id || (level.level && level.level.id))) || S.selected;
+      var entryObj = levelById(id);
+      lv = rawLevelFor(entryObj || id);
+    }
+    var index = randomGroupIndex(lv || {});
+    // 索引是「每个候选 action 一条」：key = "wi.fi.ai"，value = {group, size}。
+    // 所以组数 = 不同 group 的个数，候选数 = 条目数（不是条目里的 .actions）。
+    var keys = Object.keys(index || {});
+    var groups = {};
+    // 组名会在不同 fragment 复用（rogue_1-1 的 w0/f0 与 w0/f4 都叫 g1），
+    // 所以「几组」必须按 (wave.fragment, group) 去重，而不是只按组名。
+    keys.forEach(function (k) {
+      groups[k.split('.').slice(0, 2).join('.') + '|' + index[k].group] = 1;
+    });
+    return { groups: Object.keys(groups).length, candidates: keys.length };
+  }
+  function randomGroupControls(level) {
+    var stats = randomGroupStats(level);
+    if (!stats.groups) return '<div class=grp><h4>随机刷怪组 randomSpawnGroupKey</h4><div class=none>本关没有随机刷怪组</div></div>';
+    var seed = levelRandomSeed(level);
+    var seedText = (seed === null || seed === undefined || Number(seed) < 0)
+      ? '（本关 randomSeed 为 -1：实机由服务端随机）'
+      : 'randomSeed = ' + Number(seed);
+    var html = '<div class=grp><h4>随机刷怪组 randomSpawnGroupKey</h4>'
+      + '<label class=chk>口径 <select id=rg-policy>'
+      + '<option value=pinned' + (S.rgPolicy === 'pinned' ? ' selected' : '') + '>抽中的那一条（默认，与实机一致）</option>'
+      + '<option value=all' + (S.rgPolicy === 'all' ? ' selected' : '') + '>全部候选（对比用，会多排几条）</option>'
+      + '<option value=seed' + (S.rgPolicy === 'seed' ? ' selected' : '') + '>按 randomSeed 抽一条（candidate）</option>'
+      + '</select> <span class=muted>' + stats.groups + ' 组 / ' + stats.candidates + ' 条候选</span></label>'
+      + '<div class=zero>' + esc(seedText) + '；机制与随机源已 static 确认，抽取算术仍是 candidate'
+      + '（详见 docs/02-knowledge/spawn-schedule.md §16）</div></div>';
     return html;
   }
   function spawnPointOf(row) {
@@ -190,9 +249,14 @@
      详见 spawn-schedule.md §16。 */
   var RG_INDEX_CACHE = {};
   function randomGroupIndex(level) {
-    if (!level) return {};
-    var key = level.id || '__';
-    if (RG_INDEX_CACHE[key]) return RG_INDEX_CACHE[key];
+    // 只有**带 waves 的原始关卡**才有候选可数。曾经用「解码后的载荷/打包条目」调用过这里，
+    // 它没有 waves ⇒ 得到空索引，却把空索引按 level.id 缓存下来（缓存投毒），
+    // 之后每次统计都是 0 组，页面上「随机刷怪组」选择器永远不出现。
+    if (!level || !level.waves) return {};
+    // 只有带 id 的关卡才进缓存：曾经没有 id 时统一用 '__' 当键，于是**第一关**（默认 0-1，
+    // 没有随机组）算出的空索引被所有后续关卡共用，导致别的关卡永远显示「本关没有随机刷怪组」。
+    var key = level.id || null;
+    if (key && RG_INDEX_CACHE[key]) return RG_INDEX_CACHE[key];
     var index = {};
     var waves = level.waves || [];
     for (var wi = 0; wi < waves.length; wi++) {
@@ -211,7 +275,7 @@
         }
       }
     }
-    RG_INDEX_CACHE[key] = index;
+    if (key) RG_INDEX_CACHE[key] = index;
     return index;
   }
   function applyRandomGroups(rows, level) {
@@ -224,13 +288,63 @@
     }
     return rows;
   }
+  //: 当前关卡里所有 (组, 候选) 的平铺顺序（用 spawn-waves 的原始波次数出来）。
+  function rgPairs() {
+    var lv = rawLevelFor(levelById(S.selected) || S.selected);
+    if (!lv) return [];
+    var index = randomGroupIndex({ id: S.selected, waves: lv.waves });
+    var seen = {}, out = [];
+    Object.keys(index).forEach(function (k) {
+      var parts = k.split('.');
+      var key = parts[0] + '.' + parts[1] + '|' + index[k].group;
+      if (seen[key]) return;
+      seen[key] = 1;
+      for (var i = 0; i < (index[k].size || 1); i++) {
+        out.push({ wave: Number(parts[0]), fragment: Number(parts[1]),
+                   group: index[k].group, index: i, size: index[k].size || 1 });
+      }
+    });
+    return out;
+  }
+  function rgPinsForCursor(cursor) {
+    var pairs = rgPairs();
+    if (!pairs.length) return {};
+    var at = pairs[((cursor % pairs.length) + pairs.length) % pairs.length];
+    var pins = {}, seen = {};
+    pairs.forEach(function (p) {
+      var key = p.group + '@w' + p.wave + '/f' + p.fragment;
+      if (seen[key]) return;
+      seen[key] = 1;
+      pins[key] = (p.group === at.group && p.wave === at.wave && p.fragment === at.fragment)
+        ? at.index : 0;
+    });
+    return pins;
+  }
+  // 备注列的随机组标记（用户口径 8）：`随机组 e1，当前 1/2，概率 1%`。
+  //   当前 x/N = 这一组现在显示的第几条候选；概率 p% = 该候选 weight ÷ 组内 weight 之和。
+  function randomGroupPercent(weights, index) {
+    if (!weights || !weights.length) return null;
+    var total = weights.reduce(function (a, b) { return a + Number(b || 0); }, 0);
+    if (!(total > 0)) return null;
+    var pct = Number(weights[index] || 0) * 100 / total;
+    return Math.abs(pct - Math.round(pct)) < 1e-9 ? (Math.round(pct) + '%') : (pct.toFixed(1) + '%');
+  }
   function randomGroupTag(row) {
     if (!row || !row.random_group) return '';
-    var size = Number(row.random_group_size || 0);
-    var title = 'randomSpawnGroupKey=' + row.random_group + '，同组 ' + size
-      + ' 条候选，客户端只出抽中的那一条（PhaseData::FetchActionsWithRandomSpawn 0x42005cc）';
-    return '<span class="tag candidate" title="' + esc(title) + '">随机组 '
-      + esc(row.random_group) + (size > 1 ? ' · ' + size + ' 选 1（候选）' : '') + '</span>';
+    var size = Number(row.random_group_size || 0) || 1;
+    var weights = (row.random_group_weights && row.random_group_weights.length)
+      ? row.random_group_weights : null;
+    var groupKey = row.random_group + '@w' + row.wave + '/f' + row.fragment;
+    var pin = Number((S.rgPins || {})[groupKey] || 0);
+    var pct = randomGroupPercent(weights, pin) || (1 / size);
+    var title = '点击切换：' + row.random_group + ' 共 ' + size + ' 种候选，当前第 ' + (pin + 1) + ' 种'
+      + (weights ? '（权重 ' + weights.join('/') + '）' : '')
+      + '· 客户端只出抽中的那一条（PhaseData::FetchActionsWithRandomSpawn 0x42005cc）';
+    // 非 all 口径下，这一行就是被选中的那条（seed 抽中 / pinned 手动指定）→ 加 chosen 类。
+    var cls = 'tag rg' + (S.rgPolicy !== 'all' && row.random_group_chosen ? ' chosen' : '');
+    return '<span class="' + cls + '" data-rg="' + esc(groupKey) + '" data-rg-size="' + size
+      + '" title="' + esc(title) + '">随机组 ' + esc(row.random_group)
+      + '，当前 ' + (pin + 1) + '/' + size + '，概率 ' + esc(pct) + '</span>';
   }
   function rowHtml(row, index) {
     var sp = spawnPointOf(row);
@@ -249,12 +363,43 @@
       + '<td class="sp-cell"' + (sp ? ' data-sp="' + esc((row.route_source || 'routes') + ':' + row.route) + '"' : '')
       + ' title="' + (sp ? '出生点 ' + esc(sp.label) + '（prts.map 坐标）' : '') + '">'
       + (sp ? '<b>' + esc(sp.label) + '</b>' : '-') + '</td>'
-      + '<td>' + esc(row.enemy_name || row.key) + '</td>'
-      + '<td>' + where + '</td>'
-      + '<td>' + (row.route === null || row.route === undefined ? '-' : esc(row.route)) + '</td>'
-      + '<td>' + (row.hidden_group ? '<span class=tag>隐藏组 ' + esc(row.hidden_group) + '</span>' : '')
-      + randomGroupTag(row) + '</td>'
+      // 敌人 / 内容：本地版（preview/spawn-times.js）一直是「名字 + 编号」两段，
+      // 分发版这里跟它对齐；非 SPAWN 行本来就没有名字，只显示内容 key。
+      + '<td>' + (row.enemy_name
+          ? esc(row.enemy_name) + ' <span class=tag>' + esc(row.key || '') + '</span>'
+          : esc(row.key || '')) + '</td>'
+      // 用户口径：删掉「来源 / 路线」列后每行必须只剩 5 格（多一格会把最后一列挤出可视区）。
+      + '<td><span class=zero>' + where + '</span>'
+      + (row.hidden_group ? ' <span class=tag>隐藏组 ' + esc(row.hidden_group) + '</span>' : '')
+      + randomGroupTag(row) + delayToBornTag(row) + '</td>'
       + '</tr>';
+  }
+  //: 敌人 prefab 的 `_DelayToBorn`（帧）。它**不在关卡数据里**，单独存在敌人库
+  //: （导出时按 `enemyDbRefs` + 关卡真正用到的 action.key 裁成 `spawn-waves.js` 的 `d`），
+  //: 客户端 `Scheduler::_DealAction`（ARM64 0x27e3600 fsub / 0x27e3604 fmax）对 SPAWN 条目
+  //: 做 `t = max(t - delayToBorn, 0)`。页面在备注列标出非零值，方便手算时别忘了这一步。
+  function levelDelayTable() {
+    var id = S.selected;
+    if (!id) return null;
+    var entry = (window.__SPAWN_WAVES__ || {})[id];
+    if (!entry || Array.isArray(entry)) return null;
+    return entry.d || null;
+  }
+  function delayToBornTag(row) {
+    if (!row || !row.is_spawn || !row.key) return '';
+    var table = levelDelayTable();
+    var frames = table ? Number(table[row.key]) : 0;
+    if (!frames) {
+      // 变体 id（`enemy_2133_shdopl_b`）在导出时已按 base 回退写进表里，这里再兜一层
+      var base = String(row.key).replace(/^(.+?)_[a-z]\d*$/, '$1');
+      frames = table ? Number(table[base] || 0) : 0;
+    }
+    if (!(frames > 0)) return '';
+    var seconds = frames / 30;
+    var title = 'enemy ' + row.key + ' 的 _DelayToBorn = ' + frames + ' 帧（' + seconds
+      + 's）：客户端对 SPAWN 条目做 t = max(t - delayToBorn, 0)，这一行的实际帧已按此提前；'
+      + '值来自独立的敌人库（spawn-waves.js 的 d 表，导出源 enemy-delay-born-global.json）';
+    return ' <span class="tag shift" title="' + esc(title) + '">delayToBorn ' + seconds + 's</span>';
   }
   function gateRowHtml(gate) {
     var prev = (gate.prev_last_spawn === null || gate.prev_last_spawn === undefined)
@@ -269,11 +414,105 @@
       + (gate.source === 'user' ? ' <span class=tag>手动</span>' : '') + '</div>';
   }
 
-  // 列宽由表头（grid）与每个 fragment 的事件表（table-layout:fixed）共用，拆成多个盒子后列仍对齐。
-  var TL_COLS = '104px 132px 108px auto 172px 138px 156px';
-  var TL_COLS_HTML = TL_COLS.split(' ').map(function (w) {
-    return '<col' + (w === 'auto' ? '' : ' style="width:' + w + '"') + '>';
-  }).join('');
+  // 列宽由表头（grid）与每个 fragment 的事件表（table-layout:fixed）共用**同一组像素值**。
+  // 列宽（用户口径 2026-09-18）：表头分隔条可拖动调整；切换关卡时按内容自动适配。
+  //
+  // 为什么必须两边同一组像素：`table-layout:fixed` 的表格在自身宽度大于列宽之和时会把富余宽度
+  // **按比例**摊到各列，而表头 grid 用的是写死的像素 —— 两边会差 5px 级并逐列累积，
+  // 横向滚动时表头还会在右半边整段空白。现在两边写死同一组像素、并把富余宽度算进列宽里，
+  // 所以「表头 ↔ 事件列」逐像素对齐；只有内容真的放不下时才横向滚动（最右一列仍能滚到）。
+  var TL_DEFAULT = [104, 132, 108, 320, 190];
+  var TL_MIN = 56, TL_MAX = 520;
+  var TL_WIDTHS = TL_DEFAULT.slice();
+  var TL_DRAGGED = false;
+  function tlWidth(w) { return Math.max(TL_MIN, Math.round(w || 120)); }
+  function tlSumW() {
+    return TL_WIDTHS.reduce(function (a, w) { return a + tlWidth(w); }, 0);
+  }
+  function tlColsCss() {
+    return TL_WIDTHS.map(function (w) { return tlWidth(w) + 'px'; }).join(' ');
+  }
+  function tlColsHtml() {
+    return TL_WIDTHS.map(function (w) {
+      return '<col style="width:' + tlWidth(w) + 'px">';
+    }).join('');
+  }
+  function applyColWidths() {
+    var sum = tlSumW();
+    var head = document.querySelector('#timeline .tl-head');
+    if (head) {
+      head.style.gridTemplateColumns = tlColsCss();
+      head.style.width = sum + 'px';
+    }
+    Array.prototype.forEach.call(document.querySelectorAll('#timeline table.ev-table'), function (t) {
+      t.style.width = sum + 'px';
+    });
+    Array.prototype.forEach.call(document.querySelectorAll('#timeline colgroup'), function (cg) {
+      TL_WIDTHS.forEach(function (w, i) {
+        var c = cg.children[i];
+        if (c) c.style.width = tlWidth(w) + 'px';
+      });
+    });
+  }
+  // 切关卡自动适配：列内是 nowrap，`scrollWidth` 能测出内容宽，取表头与所有单元格的最大值。
+  function autoFitColumns() {
+    var head = document.querySelector('#timeline .tl-head');
+    var tl = $('timeline');
+    if (!head || !tl) return;
+    TL_WIDTHS = TL_DEFAULT.slice();
+    applyColWidths();
+    var need = TL_DEFAULT.map(function () { return 0; });
+    Array.prototype.forEach.call(head.children, function (sp, i) {
+      if (i < need.length) need[i] = Math.max(need[i], sp.scrollWidth || 0);
+    });
+    Array.prototype.forEach.call(document.querySelectorAll('#timeline td'), function (td) {
+      var tr = td.parentElement;
+      if (!tr) return;
+      var i = Array.prototype.indexOf.call(tr.children, td);
+      if (i >= 0 && i < need.length) need[i] = Math.max(need[i], td.scrollWidth || 0);
+    });
+    var w = need.map(function (v, i) {
+      return Math.max(TL_MIN, Math.min(TL_MAX, Math.ceil(v + 18))) || TL_DEFAULT[i];
+    });
+    // 富余宽度按列宽比例摊回去：表格正好铺满容器（= 表头宽度），两边列宽逐像素相同；
+    // 内容放不下时保持内容宽，让 #timeline 横向滚动到最后一列。
+    var avail = Math.max(320, tl.clientWidth - 40);   // 40 = 表头/事件表左右各 20px 的内缩
+    var sum = w.reduce(function (a, b) { return a + b; }, 0);
+    if (sum < avail) {
+      var rest = avail - sum;
+      w = w.map(function (v) { return v + Math.floor(rest * (v / sum)); });
+      rest = avail - w.reduce(function (a, b) { return a + b; }, 0);
+      for (var i = 0; rest > 0; i = (i + 1) % w.length) { w[i] += 1; rest -= 1; }
+    }
+    TL_WIDTHS = w;
+    applyColWidths();
+  }
+  function bindColumnResize() {
+    var head = document.querySelector('#timeline .tl-head');
+    if (!head || head.dataset.resize === '1') return;
+    head.dataset.resize = '1';
+    Array.prototype.forEach.call(head.querySelectorAll('.col-resize'), function (handle) {
+      var col = Number(handle.dataset.col);
+      handle.addEventListener('mousedown', function (ev) {
+        ev.preventDefault(); ev.stopPropagation();
+        var startX = ev.clientX;
+        var cell = head.children[col];
+        var startW = (cell && cell.getBoundingClientRect) ? cell.getBoundingClientRect().width : 120;
+        var move = function (e) {
+          TL_DRAGGED = true;
+          TL_WIDTHS[col] = Math.max(TL_MIN, Math.min(TL_MAX, Math.round(startW + (e.clientX - startX))));
+          applyColWidths();
+        };
+        var up = function () {
+          document.removeEventListener('mousemove', move);
+          document.removeEventListener('mouseup', up);
+        };
+        document.addEventListener('mousemove', move);
+        document.addEventListener('mouseup', up);
+      });
+      handle.addEventListener('dblclick', function (ev) { ev.stopPropagation(); autoFitColumns(); });
+    });
+  }
   function fragInfoOf(frags, wave, fragment) {
     for (var i = 0; i < frags.length; i++) {
       if (frags[i].wave === wave && frags[i].fragment === fragment) return frags[i];
@@ -347,15 +586,18 @@
             : 'fragment f' + f.fragment + ' · 起点 ' + (info ? sf(info.start_frame) : '-')
               + ' → 排空到 <b>' + (info ? sf(info.completion_frame) : '-') + '</b>（队列条目 '
               + (info ? info.queue_entries : '-') + '） · 生成 ' + f.spawns + ' 次')
-          + '</div><table class=ev-table><colgroup>' + TL_COLS_HTML + '</colgroup><tbody>'
+          + '</div><table class=ev-table style="width:' + tlSumW() + 'px"><colgroup>' + tlColsHtml() + '</colgroup><tbody>'
           + f.items.map(function (it) { return rowHtml(it.row, it.index); }).join('')
           + '</tbody></table></div>';
       });
       body += '</div>';
     });
-    return '<div class=tl-head style="grid-template-columns:' + TL_COLS + '">'
-      + '<span>事件</span><span>实际时间</span><span>出生点(prts.map)</span>'
-      + '<span>敌人 / 内容</span><span>来源</span><span>路线</span><span>标记</span></div>'
+    return '<div class=tl-head style="width:' + tlSumW() + 'px;grid-template-columns:' + tlColsCss() + '">'
+      + '<span>事件<i class=col-resize data-col=0 title="拖动调整列宽，双击恢复自适应"></i></span>'
+      + '<span>实际时间<i class=col-resize data-col=1 title="拖动调整列宽，双击恢复自适应"></i></span>'
+      + '<span>出生点(prts.map)<i class=col-resize data-col=2 title="拖动调整列宽，双击恢复自适应"></i></span>'
+      + '<span>敌人 / 内容<i class=col-resize data-col=3 title="拖动调整列宽，双击恢复自适应"></i></span>'
+      + '<span>备注<i class=col-resize data-col=4 title="拖动调整列宽，双击恢复自适应"></i></span></div>'
       + '<div class=tl-body>' + (body || '<div class=none>没有事件</div>') + '</div>';
   }
 
@@ -434,6 +676,18 @@
     if (!box || box.dataset.pick === '1' || !box.addEventListener) return;
     box.dataset.pick = '1';
     box.addEventListener('click', function (ev) {
+      // 备注列里的随机刷怪组标签：点一下切到下一个候选（pinned 口径）。
+      var tag = ev.target.closest && ev.target.closest('.tag.rg[data-rg]');
+      if (tag) {
+        ev.stopPropagation();
+        ev.preventDefault();
+        // 用户口径：点一次轮换到下一格，跨组循环（e1 → e2 → e3 → e1）。
+        S.rgCursor = (Number(S.rgCursor || 0) + 1) % Math.max(1, rgPairs().length);
+        S.rgPins = rgPinsForCursor(S.rgCursor);
+        S.rgPolicy = 'pinned';
+        recompute({});
+        return;
+      }
       var tr = ev.target.closest && ev.target.closest('tr[data-row]');
       if (!tr) return;
       var index = Number(tr.dataset.row);
@@ -463,7 +717,10 @@
     var seed = (rg && rg.seed !== null && rg.seed !== undefined) ? '，randomSeed ' + rg.seed : '';
     return ' <span class="tag candidate" title="同组只出抽中的那一条（PhaseData::FetchActionsWithRandomSpawn 0x42005cc；'
       + '落选条目 isValid=0，出队侧跳过且不占帧）。抽取算术仍是 candidate，见 spawn-schedule.md §16">随机组 '
-      + groups + ' 组 · 已列出全部候选（每组只出 1 条）' + seed + '</span>';
+      + groups + ' 组 · ' + ((rg && rg.policy === 'all')
+        ? '已列出全部候选（对比口径）'
+        : (rg && rg.policy === 'seed' ? '按 randomSeed 抽中的一条' : '当前候选（与实机一致：每组只出 1 条）'))
+      + seed + '</span>';
   }
 
   function render() {
@@ -481,6 +738,9 @@
       + rgSummary;
     $('timeline').innerHTML = timelineHtml(data);
     bindRowSelection();
+    // 用户口径：列宽可拖动，切换关卡时自动按内容适配。
+    autoFitColumns();
+    bindColumnResize();
     var mapBody = $('map-body');
     if (mapBody) mapBody.innerHTML = mapBodyHtml(S.data, S.sel, S.rows, S.spawnNo);
     Array.prototype.forEach.call($('options').querySelectorAll('[data-g]'), function (n) {
@@ -490,6 +750,9 @@
       n.onchange = function () { toggleBranch(n.dataset.b, n.checked); };
     });
     var trig = $('trigger'); if (trig) trig.onchange = function () { S.branchTrigger = Math.max(0, Number(trig.value) || 0); recompute({}); };
+    // 随机刷怪组口径选择器：`#options` 每次 render() 都会重建，必须在这里重新绑。
+    var rgSel = $('rg-policy');
+    if (rgSel) rgSel.onchange = function () { S.rgPolicy = rgSel.value; recompute({}); };
     Array.prototype.forEach.call($('timeline').querySelectorAll('[data-gate]'), function (n) {
       n.onchange = function () {
         var w = String(n.dataset.gate);
@@ -527,7 +790,12 @@
     var prev = S.data || {};
     var consumption = over.consumption || prev.consumption || 'client_accumulated';
     var queueOrder = over.queue_order || prev.queue_order || 'mono_qsort';
-    var encoded = S.custom ? null
+    // 预计算载荷是 `all` 口径；选了 `seed` 就必须本地现算（否则页面显示的还是全部候选）。
+    // `pinned` 不带 pins = 每一组都取第 0 条候选（= 页面默认口径，与实机一致：
+    // 客户端每组只出一条）。以前这里会把 pinned 回退成 all（把落选条目也排进队列），
+    // 于是畸症这类关卡默认就比实机晚 1 帧，点标签切回第 1 条也和初始显示不一致。
+    var seededRG = (S.rgPolicy === 'seed' || S.rgPolicy === 'pinned');
+    var encoded = (S.custom || seededRG) ? null
       : (D.payloads[comboKey(S.selected, S.groups, S.branches, S.branchTrigger)] || null);
     var payload = null;
     var notice = '';
@@ -536,21 +804,28 @@
       // 其余组合本地算不了，如实说明，不假装分支行已经算过。
       notice = '本关没有可用的分支定义（spawn-waves.js 缺 branches），只显示常规波次。';
     }
+    // 出生点/地图只存在于预计算载荷里（分发包不塞原始 mapData/routes）：
+    // 本地重算（隐藏组子集 / 随机组口径 / 默认 pinned）之前先把它们缓存好，
+    // 否则出生点列会空白、右侧常驻地图是 0 格。
+    ensureMapCache(level, S.selected);
     if (!encoded) {
       try {
         payload = computeLocally(level, consumption, queueOrder);
       } catch (e) {
-        renderMessage(e && e.message ? e.message : String(e));
-        return;
+        // 本地重算要 spawn-waves.js；缺它的关卡退回预计算载荷（`all` 口径），
+        // 只把口径差异写在提示里，不让整页变成错误页。
+        var fallback = D.payloads[comboKey(S.selected, [], [], 0)] || null;
+        if (!fallback) {
+          renderMessage(e && e.message ? e.message : String(e));
+          return;
+        }
+        payload = decodePayload(fallback);
+        payload.branch_notice = '本地重算不可用（' + (e && e.message ? e.message : String(e))
+          + '），这里退回预计算载荷：随机刷怪组按「全部候选」列出。';
       }
       if (notice) payload.branch_notice = notice;
     } else {
-      // 数据文件是紧凑线格式（全部 3876 关也能塞进去），选中时按需解码。
-      payload = (encoded.l && window.SpawnCodec)
-        ? window.SpawnCodec.decodePayload(encoded, { keys: D.keys || [], names: D.names || [],
-                                                     groups: D.groups || [], version: D.version,
-                                                     rgkeys: D.rgkeys || [] })
-        : JSON.parse(JSON.stringify(encoded));
+      payload = decodePayload(encoded);
       payload.consumption = consumption;
       payload.queue_order = queueOrder;
       if (notice) payload.branch_notice = notice;
@@ -616,6 +891,24 @@
   function comboKey(id, groups, branches, trigger) {
     return [id, groups.slice().sort().join(','), branches.slice().sort().join(','), trigger].join('#');
   }
+  /* 数据文件是紧凑线格式（全部 3876 关也能塞进去），选中时按需解码。 */
+  function decodePayload(encoded) {
+    return (encoded && encoded.l && window.SpawnCodec)
+      ? window.SpawnCodec.decodePayload(encoded, { keys: D.keys || [], names: D.names || [],
+                                                   groups: D.groups || [], version: D.version,
+                                                   rgkeys: D.rgkeys || [] })
+      : JSON.parse(JSON.stringify(encoded || {}));
+  }
+  /* 出生点 / 地图与隐藏组、随机组都无关，只存在于预计算载荷里；本地重算之前先缓存一份。 */
+  function ensureMapCache(level, levelId) {
+    var key = levelId || (level && level.id) || 'custom';
+    if (MAP_CACHE[key]) return MAP_CACHE[key];
+    var base = D.payloads[comboKey(key, [], [], 0)] || null;
+    if (!base) return null;
+    var decoded = decodePayload(base);
+    MAP_CACHE[key] = { map: decoded.map, spawn_points: decoded.spawn_points };
+    return MAP_CACHE[key];
+  }
   function mapCells(level) {
     var md = level.mapData || {}, grid = md.map || [], tiles = md.tiles || [];
     var rows = grid.length, cols = grid.reduce(function (n, r) { return Math.max(n, r.length); }, 0);
@@ -670,13 +963,18 @@
     });
     var sch = C.schedule(lv, { consumption: consumption, queue_order: queueOrder,
       enemy_delay_mt: lvEntry.d || null, wave_gates: gateMap,
+      random_groups: { policy: S.rgPolicy || 'all', seed: levelRandomSeed(level), pins: S.rgPins || {} },
       enabled_hidden_groups: S.groups });
     var rows = sch.rows.map(function (r) {
       return { track: 'wave', track_rank: 0, kind: r.kind, is_spawn: r.kind === 'SPAWN',
         key: r.key, enemy_name: KEY_NAME[r.key] || null, wave: r.wave, fragment: r.fragment,
         action: r.action, seq: r.seq, route: r.route, route_source: 'routes',
         ideal_frame: r.ideal_frame, actual_frame: r.actual_frame, synthetic: r.synthetic,
-        hidden_group: r.hidden_group || null, confidence: 'client_js_port (已与 Python 对拍)' };
+        hidden_group: r.hidden_group || null,
+        random_group: r.random_group || null, random_group_size: r.random_group_size || null,
+        random_group_chosen: r.random_group_chosen || null,
+        random_group_weights: r.random_group_weights || null,
+        confidence: 'client_js_port (已与 Python 对拍)' };
     });
     // 分支轨：任意子集 + 任意触发帧现算（core.js:scheduleBranches，与 Python 逐条对拍）
     var branchRows = [];
@@ -720,6 +1018,7 @@
       name: level.name || '', path: level.path || '(本地文件)' },
       consumption: consumption, queue_order: queueOrder, selected: { hidden_groups: S.groups },
       options: level.options || { hidden_groups: [], branches: [] },
+      random_groups: localRandomGroups(level, lv),
       // 与 Python payload 同口径：rows/spawns 只数波次轨，分支轨单列 branch_rows/branch_spawns
       summary: { rows: rows.length, spawns: waveSpawns,
         branch_rows: branchRows.length, branch_spawns: spawns.length - waveSpawns,
@@ -727,6 +1026,23 @@
         fragments: sch.completions, skipped: [], skipped_count: 0 },
       rows: rows, branch_rows: branchRows, map: localMap(lv, levelId),
       spawn_points: localSpawnPoints(lv, levelId) };
+  }
+  /* 本地重算也要报「随机刷怪组」块：摘要要写 randomSeed 与口径，行上的标签也要权重。
+     形状与 Python payload 一致（counts / groups / chosen_index / weights）。 */
+  function localRandomGroups(level, lv) {
+    var plan = C.randomGroupPlan(lv, S.rgPolicy || 'pinned', levelRandomSeed(level), S.rgPins || {});
+    var total = function (g) {
+      return g.candidates.reduce(function (a, c) { return a + Number(c.weight || 0); }, 0);
+    };
+    return { policy: plan.policy, seed: plan.seed, counts: plan.counts, confidence: plan.confidence,
+      groups: (plan.groups || []).map(function (g) {
+        return { wave: g.wave, fragment: g.fragment, group: g.group,
+          candidates: g.candidates.map(function (c) { return c.action; }),
+          weights: g.candidates.map(function (c) { return Number(c.weight || 0); }),
+          kept: g.chosen_action, dropped: g.dropped, chosen_index: g.chosen,
+          chosen_weight: (g.candidates[g.chosen] || {}).weight, total_weight: total(g),
+          pack_keys: g.candidates.map(function () { return ''; }), policy: plan.policy };
+      }) };
   }
   /* 地图/出生点与隐藏组无关：自定义文件里有 mapData 就用它，否则复用同一关
      默认载荷解码时缓存下来的副本。 */
@@ -762,17 +1078,83 @@
     recompute({});
     renderLevels();
   }
+  /* 左侧边栏：拖动 #side-resize 调宽；双击分隔条或点 #side-toggle 收起/展开（localStorage 记忆）。 */
+  function bindSidebar() {
+    // 主流做法：侧栏右侧一条常驻的竖直轨道放箭头；收起后轨道还在，箭头掉头即可展开。
+    var main = document.querySelector('main');
+    var bar = document.getElementById('side-bar');
+    var grip = document.getElementById('side-resize');
+    var toggle = document.getElementById('side-toggle');
+    if (!main || !bar || !grip) return;
+    var KEY_W = 'ark.side.width', KEY_C = 'ark.side.collapsed';
+    var RAIL = 22;
+    var sideWidth = 320;
+    var collapsed = function () { return main.classList.contains('side-collapsed'); };
+    var applyWidth = function () {
+      main.style.setProperty('--side-w', (collapsed() ? RAIL : sideWidth) + 'px');
+    };
+    var paintToggle = function () {
+      if (!toggle) return;
+      toggle.title = collapsed() ? '展开左侧栏' : '收起左侧栏';
+      toggle.setAttribute('aria-expanded', collapsed() ? 'false' : 'true');
+      toggle.setAttribute('aria-label', collapsed() ? '展开左侧栏' : '收起左侧栏');
+    };
+    var setCollapsed = function (on) {
+      main.classList.toggle('side-collapsed', !!on);
+      applyWidth();
+      paintToggle();
+      // 右侧变宽/变窄后按新宽度重排列宽（否则表格列停在旧宽度，看着像「右边显示不对」）。
+      if (typeof autoFitColumns === 'function') autoFitColumns();
+      try { localStorage.setItem(KEY_C, on ? '1' : '0'); } catch (e) { /* ignore */ }
+    };
+    try {
+      var w0 = Number(localStorage.getItem(KEY_W) || 0);
+      if (w0 >= 180 && w0 <= 640) sideWidth = w0;
+      if (localStorage.getItem(KEY_C) === '1') main.classList.add('side-collapsed');
+    } catch (e) { /* file:// 下 localStorage 可能不可用 */ }
+    applyWidth();
+    paintToggle();
+    var remember = function () {
+      try {
+        localStorage.setItem(KEY_W, String(Math.round(sideWidth)));
+        localStorage.setItem(KEY_C, collapsed() ? '1' : '0');
+      } catch (e) { /* ignore */ }
+    };
+    grip.addEventListener('mousedown', function (ev) {
+      if (collapsed()) return;
+      ev.preventDefault();
+      var startX = ev.clientX, startW = bar.getBoundingClientRect().width;
+      var move = function (e) {
+        sideWidth = Math.max(180, Math.min(640, Math.round(startW + (e.clientX - startX))));
+        applyWidth();
+      };
+      var up = function () {
+        document.removeEventListener('mousemove', move);
+        document.removeEventListener('mouseup', up);
+        remember();
+      };
+      document.addEventListener('mousemove', move);
+      document.addEventListener('mouseup', up);
+    });
+    grip.addEventListener('dblclick', function () { setCollapsed(!collapsed()); });
+    if (toggle) toggle.onclick = function () { setCollapsed(!collapsed()); };
+  }
+
   function boot() {
     if (!refreshData().levels.length) return;
     if (!window.SpawnCore) return;
+    bindSidebar();
     $('search').oninput = function () { S.query = $('search').value; renderLevels(); };
-    var scope = $('scope');
-    if (scope) {
-      scope.value = S.scope;
-      scope.onchange = function () { S.scope = scope.value; renderLevels(); };
-    }
     var onlyOpts = $('only-options');
     if (onlyOpts) onlyOpts.onchange = function () { S.onlyOptions = !!onlyOpts.checked; renderLevels(); };
+    // 注意：`#rg-policy` 是 render() 每次重建 #options 时新生成的节点，
+    // 所以在 boot() 里抓一次引用是错的（换过关卡之后选择器就点不动了）——
+    // 绑定放在 render() 里（见下），这里只留窗口 resize。
+    var rt = 0;
+    window.addEventListener('resize', function () {
+      clearTimeout(rt);
+      rt = setTimeout(function () { if (!TL_DRAGGED) autoFitColumns(); }, 150);
+    });
     var spawnOnly = $('spawn-only');
     if (spawnOnly) spawnOnly.onchange = function () { S.spawnOnly = !!spawnOnly.checked; render(); };
     $('file').onchange = function (ev) {
@@ -793,7 +1175,9 @@
   window.SpawnApp = { boot: boot, select: select, refresh: refresh, S: S, loadFile: loadFile,
     MAP_CACHE: MAP_CACHE,
     mapBodyHtml: mapBodyHtml, mapPanelHtml: mapPanelHtml, applySelection: applySelection, spawnOrdinals: spawnOrdinals,
-    timelineHtml: timelineHtml, matchLevel: matchLevel, prtsLabel: C.prtsLabel };
+    timelineHtml: timelineHtml, matchLevel: matchLevel, prtsLabel: C.prtsLabel,
+    randomGroupStats: randomGroupStats, randomGroupIndex: randomGroupIndex,
+    levelRandomSeed: levelRandomSeed, rgPairs: rgPairs, rgPinsForCursor: rgPinsForCursor };
   // 数据可能是 gzip+base64（见 tools/export_spawn_timeline_dist.py），
   // 那种情况下由页内 bootstrap 解压完再调 boot()。
   if (window.__SPAWN_DATA__) {

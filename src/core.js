@@ -112,6 +112,122 @@
     return quickSort(items, byTime);
   }
 
+  // ---------------------------------------------------------------------------
+  // 随机刷怪组的抽取：`System.Random`（.NET Knuth 减法）+ `UniformWithWeight`
+  //
+  // 客户端 `RandomGroupSchedulerPreprocessor::DoPreprocess`（ARM64 0x27f8050）把带
+  // `randomSpawnGroupKey` 的 action 按 (wave, fragment, key) 分组；`PhaseData::
+  // FetchActionsWithRandomSpawn`（0x42005cc）逐组抽一条、把落选的置 `isValid = 0`
+  // （0x42006f8），出队侧 `_ExecuteActionQueue::MoveNext`（0x27e9c00）跳过 invalid
+  // 条目且**不占帧**。随机源是 `IBattleRandom.UniformWithWeight` + `action.weight`。
+  //
+  // 这里是 tools/dotnet_random.py 的逐行移植（同一个 seed ⇒ 同一个序列），用于分发版
+  // 在没有服务端的情况下复现 `seed` 口径；抽取算术本身仍是 candidate。
+  // ---------------------------------------------------------------------------
+  var MBIG = 2147483647, MSEED = 161803398;
+  function DotNetRandom(seed) {
+    this.sa = new Array(56);
+    for (var i = 0; i < 56; i++) this.sa[i] = 0;
+    this.inext = 0; this.inextp = 21;
+    this.setSeed(Math.trunc(num(seed, 0)));
+  }
+  DotNetRandom.prototype.setSeed = function (seed) {
+    if (seed === -2147483648) seed = MBIG;
+    else seed = Math.abs(seed);
+    var mj = MSEED - seed, mk = 1;
+    this.sa[55] = mj;
+    for (var i = 1; i < 55; i++) {
+      var ii = (21 * i) % 55;
+      this.sa[ii] = mk;
+      mk = mj - mk;
+      if (mk < 0) mk += MBIG;
+      mj = this.sa[ii];
+    }
+    for (var k = 1; k < 5; k++) {
+      for (var j = 1; j < 56; j++) {
+        this.sa[j] -= this.sa[1 + (j + 30) % 55];
+        if (this.sa[j] < 0) this.sa[j] += MBIG;
+      }
+    }
+    this.inext = 0; this.inextp = 21;
+    return this;
+  };
+  DotNetRandom.prototype.internalSample = function () {
+    var inext = this.inext + 1; if (inext >= 56) inext = 1;
+    var inextp = this.inextp + 1; if (inextp >= 56) inextp = 1;
+    var ret = this.sa[inext] - this.sa[inextp];
+    if (ret === MBIG) ret -= 1;
+    if (ret < 0) ret += MBIG;
+    this.sa[inext] = ret;
+    this.inext = inext; this.inextp = inextp;
+    return ret;
+  };
+  DotNetRandom.prototype.sample = function () { return this.internalSample() * (1.0 / MBIG); };
+
+  /** `IBattleRandom.UniformWithWeight<T>`：totalWeight 上的加权均匀（算术 candidate）。 */
+  function uniformIndexWithWeight(rng, weights) {
+    var total = 0, i;
+    for (i = 0; i < weights.length; i++) total += Number(weights[i]) || 0;
+    if (!(total > 0)) return 0;
+    var r = rng.sample() * total, acc = 0;
+    for (i = 0; i < weights.length; i++) {
+      acc += Number(weights[i]) || 0;
+      if (r < acc) return i;
+    }
+    return weights.length - 1;
+  }
+
+  /** 一次性把随机刷怪组展开成确定性计划（与 tools/battle_simulator.py:random_spawn_group_plan 同构）。 */
+  function randomGroupPlan(level, policy, seed, pins) {
+    policy = policy || 'all';
+    // `pinned`：页面点备注里的标签轮换候选时用。键与 Python 侧一致，依次探测
+    // `"<group>@w<wave>/f<fragment>"` → `"<group>@<wave>/<fragment>"` → `"<group>"`。
+    var pinMap = pins || {};
+    function pinnedIndex(key, wi, fi) {
+      var probes = [key + '@w' + wi + '/f' + fi, key + '@' + wi + '/' + fi, key];
+      for (var i = 0; i < probes.length; i++) {
+        if (Object.prototype.hasOwnProperty.call(pinMap, probes[i])) {
+          return Math.trunc(num(pinMap[probes[i]], 0));
+        }
+      }
+      return 0;
+    }
+    var usedSeed = Math.trunc(num(seed !== undefined && seed !== null ? seed : num(level.randomSeed, 0), 0));
+    var rng = policy === 'seed' ? new DotNetRandom(usedSeed) : null;
+    var drop = {}, groups = [], counts = { groups: 0, candidates: 0, dropped: 0, selected: 0 };
+    entries(level.waves).forEach(function (wave, wi) {
+      entries(wave.fragments).forEach(function (frag, fi) {
+        var order = [], buckets = {};
+        entries(frag.actions).forEach(function (act, ai) {
+          if (!act || typeof act !== 'object') return;
+          var key = String(val(act.randomSpawnGroupKey, '') || '');
+          if (!key) return;
+          if (!buckets[key]) { buckets[key] = []; order.push(key); }
+          buckets[key].push({ action: ai, weight: Math.trunc(num(act.weight, 0)) });
+        });
+        order.forEach(function (key) {
+          var cands = buckets[key];
+          var weights = cands.map(function (c) { return c.weight; });
+          var index = policy === 'seed' ? uniformIndexWithWeight(rng, weights)
+            : policy === 'pinned' ? pinnedIndex(key, wi, fi) : 0;
+          if (!(index >= 0 && index < cands.length)) index = 0;
+          counts.groups++; counts.candidates += cands.length; counts.selected++;
+          var dropped = policy === 'all' ? [] : cands.filter(function (c, i) {
+            return i !== index;
+          }).map(function (c) { return c.action; });
+          counts.dropped += dropped.length;
+          groups.push({ wave: wi, fragment: fi, group: key, candidates: cands.map(function (c) {
+            return { action: c.action, weight: c.weight };
+          }), chosen: index, chosen_action: cands[index].action, dropped: dropped,
+            chosen_candidate: cands[index] });
+          if (dropped.length) drop['w' + wi + '/f' + fi] = (drop['w' + wi + '/f' + fi] || []).concat(dropped);
+        });
+      });
+    });
+    return { policy: policy, seed: usedSeed, drop: drop, groups: groups, counts: counts,
+      confidence: 'client_static_verified（分组/剔除、isValid 门、weight 字段）+ candidate（UniformWithWeight 算术、randomSeed 注入点）' };
+  }
+
   function actionEnabled(act, enabled) {
     var group = val(act.hiddenGroup, null);
     if (group === null || group === '' || group === undefined) return true;
@@ -122,6 +238,7 @@
   function buildFragmentQueue(fragment, opts) {
     opts = opts || {};
     var enabled = opts.enabled_hidden_groups || null;
+    var dropped = opts.dropped_actions || null;
     var fromBranch = !!opts.from_branch;
     var fragPre = milliFrames(fragment.preDelay);
     var items = [], blockCounter = 0, skipped = [];
@@ -129,6 +246,12 @@
       if (!act || typeof act !== 'object') return;
       if (!actionEnabled(act, enabled)) {
         skipped.push({ action: ai, reason: 'hidden_group_disabled', hidden_group: val(act.hiddenGroup, null) });
+        return;
+      }
+      if (dropped && dropped.indexOf(ai) >= 0) {
+        // 随机刷怪组里没被抽中的候选：客户端置 `isValid = false`，出队侧直接跳过、不占帧。
+        skipped.push({ action: ai, reason: 'random_group_not_chosen',
+          random_spawn_group_key: val(act.randomSpawnGroupKey, null) });
         return;
       }
       var atype = actionTypeName(act.actionType);
@@ -285,6 +408,9 @@
     opts = opts || {};
     var consumption = opts.consumption || 'client_accumulated';
     var enabled = opts.enabled_hidden_groups || null;
+    // 随机刷怪组：页面给 `random_groups = {policy, seed}`；`all` 不删候选（默认口径）。
+    var rgOpts = opts.random_groups || null;
+    var rg = rgOpts ? randomGroupPlan(level, rgOpts.policy, rgOpts.seed) : null;
     var rows = [], completions = [], cursor = 0;
     // 波次门（`<_DealWave>d__121` 的 `WaitWhile(_CheckWaveNotFinish)`）：门是**下界**，
     // 默认值来自离线真值表 `artifacts/client-2.7.71/wave-clear-frames.json`（该波全部敌人
@@ -302,7 +428,9 @@
         var processStart = cursor;
         var fragStart = processStart + framesOf(frag.preDelay);
         var built = buildFragmentQueue(frag, {
-          enabled_hidden_groups: enabled, queue_order: opts.queue_order, enemy_delay_mt: opts.enemy_delay_mt });
+          enabled_hidden_groups: enabled, queue_order: opts.queue_order,
+          enemy_delay_mt: opts.enemy_delay_mt,
+          dropped_actions: rg ? rg.drop['w' + wi + '/f' + fi] : null });
         var drained = drainQueue(built.items, processStart, consumption,
           fi === 0 && tailSyntheticOverlap(wave));
         var lastActual = drained.last_actual;
@@ -311,10 +439,27 @@
             : consumption === 'user_pinned' ? lastActual + 1 + USER_PINNED_HANDOFF_PER_ENTRY * built.items.length
               : lastActual + 1)
           : processStart;
+        // 随机刷怪组：把「这条属于哪个组 / 几选一 / 是不是抽中的那条」写进行上，页面据此标注。
+        var rgByAction = {};
+        if (rg) {
+          rg.groups.forEach(function (g) {
+            if (g.wave !== wi || g.fragment !== fi) return;
+            var weights = g.candidates.map(function (c) { return c.weight; });
+            g.candidates.forEach(function (c, ci) {
+              rgByAction[c.action] = { group: g.group, size: g.candidates.length,
+                chosen: ci === g.chosen, weights: weights, policy: rg.policy };
+            });
+          });
+        }
         drained.rows.forEach(function (row) {
+          var rgi = rgByAction[row.item.action] || null;
           rows.push({ track: 'wave', wave: wi, fragment: fi, action: row.item.action, seq: row.item.seq,
             kind: row.item.kind, key: row.item.key, route: row.item.route, synthetic: !!row.item.synthetic,
             hidden_group: row.item.hidden_group || null,
+            random_group: rgi ? rgi.group : null,
+            random_group_size: rgi ? rgi.size : null,
+            random_group_chosen: rgi ? rgi.chosen : null,
+            random_group_weights: rgi ? rgi.weights : null,
             time_mt: row.item.time_mt, ideal_frame: row.ideal_frame, actual_frame: row.actual_frame });
         });
         if (maxWait > 0 && (completion - waveStart) > framesOf(maxWait)) {
@@ -356,6 +501,8 @@
     waveStartDelay: waveStartDelay, tailSyntheticOverlap: tailSyntheticOverlap,
     quickSort: quickSort, orderQueue: orderQueue, buildFragmentQueue: buildFragmentQueue,
     drainQueue: drainQueue, schedule: schedule, scheduleBranches: scheduleBranches,
+    DotNetRandom: DotNetRandom, uniformIndexWithWeight: uniformIndexWithWeight,
+    randomGroupPlan: randomGroupPlan,
     prtsLabel: prtsLabel,
     build: function (level, opts) { return schedule(level, opts); }
   };

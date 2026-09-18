@@ -12,6 +12,10 @@
 
 ## 0. 一句话流程
 
+**约定**：一条敌人的**出生帧 = 它出现影子的那一帧**（= 客户端创建该实体、并把它摆到路线起点的那一帧；
+模型里的 `actual_frame` 就是这个帧）。所以手工逐帧看视频时，取"影子第一次出现"的那一帧来对表，
+不要取血条/名字条/立绘完全展开的那一帧——那会晚 1~2 帧。
+
 ```
 对每一波 wave（按配置顺序）：
     波次门下界        cursor = max(cursor, 该波"上一波离场帧 + 1"的下界)
@@ -36,13 +40,14 @@
 | `actions[].preDelay` | `waves[i].fragments[j].actions[k].preDelay` | 相对 fragment 起点的偏移（秒） |
 | `actions[].actionType` | 同上 | 索引 0=SPAWN、1=PREVIEW_CURSOR、2=STORY…（本文关心 SPAWN / PREVIEW_CURSOR / DISPLAY_ENEMY_INFO） |
 | `actions[].count` / `interval` | 同上 | 只有 SPAWN / PREVIEW_CURSOR 是"多条"：第 n 条 = `t0 + round(interval*30*n)` |
-| `actions[].key` | 同上 | 敌人 id。**`_delayToBorn` 就按它查** |
+| `actions[].key` | 同上 | 敌人 id。**`_delayToBorn` 就按它查**（查的是下面那张**独立敌人库**，不是关卡 JSON） |
 | `actions[].routeIndex` | 同上 | 走哪条 `routes[]`（分支波次走 `extraRoutes[]`） |
 | `actions[].autoPreviewRoute` | 同上 | true 时客户端**额外**造 2 条 `PREVIEW_CURSOR`（本文的"路径预览"） |
 | `actions[].autoDisplayEnemyInfo` | 同上 | true 时额外造 1 条 `DISPLAY_ENEMY_INFO`（开场那个敌人提示） |
 | `actions[].hiddenGroup` | 同上 | 隐藏波次组名；没勾选时这条**整条不存在**（后面的条目因此整体前移） |
 | `actions[].blockFragment` | 同上 | 阻断计数（`m_blockCounter > 0` 时该 fragment 不结束），影响后续 fragment 的起点 |
 | `branches[key].phases[]` | 关卡根 | 分支波次，形状与 `waves[].fragments[]` 相同 |
+| **敌人库**（独立于关卡） | 敌人 prefab `Enemy._delayToBorn` + 敌人显示名 | 按 enemy id 存的敌人属性表。**至少**两列：`name`（显示名，页面「敌人 / 内容」列用）与 `delayToBorn`（秒/帧）。本仓库的 delay 值落在 `artifacts/client-2.7.71/enemy-delay-born-global.json`，名字来自 `excel/enemy_database.json`；分发版把两者打进 `spawn-waves.js`（`names` 名表 + 每关的 `d` 表）。**不要并进关卡数据**：同一个 enemy id 会出现在很多关里，而且以后还会有别的敌人级属性（攻击间隔、元素抗性…）要一起放这里 |
 
 ---
 
@@ -112,6 +117,12 @@ autoDisplayEnemyInfo == true → 1 条 DISPLAY_ENEMY_INFO，time = max(base - de
 * **变体 id 要走 base 回退**：关卡 `action.key` 可能是 `enemy_2133_shdopl_b`，而 prefab 与
   `enemyDbRefs` 落的是 `enemy_2133_shdopl`。查表顺序 = 精确 → 去掉 `_b`/`_2`/`_3` 这类后缀再查。
   不兜底会让 IS6「畸症」首怪晚 30 帧（配置 10s vs 实测 9s01f），预览也晚 30 帧（实测 6s00f）。
+* **单独存库，不写进关卡数据**：`_delayToBorn` 是**敌人**的属性，不存在关卡 JSON 的任何字段里。
+  关卡里的 `enemyDbRefs[]` / `level.enemies[]` 只是"这关引用了哪些敌人"，真正的值要按 `action.key`
+  去敌人库查（变体 id 走 base 回退）。本页每行最后的**备注**列会把非零值标出来
+  （`delayToBorn 1s` 这种），标了就意味着这一行已经在实际帧里减过它了。
+* **出生帧口径**：一条敌人的出生帧 = **出现影子的那一帧**。影子与实体创建同帧，所以它等于这里的
+  `actual_frame`；血条/名字条/立绘展开都会更晚。
 
 ### 3.5 波次门（第 2 波起）
 每一波开始前，客户端还要等上一波"打完"：门 = **上一波全部敌人离场帧 + 1**（下界）。
@@ -245,6 +256,8 @@ base = 300000 - 30000 = 270000 mt → 首怪 9s0xf，合成预览 = 270000-90000
 | 把负时间的合成预览当成不存在 | 它照样进队列、照样占帧（10-17 实测：首怪 95 vs 丢条目会算 60） |
 | 忘了 fragment 交接 2 帧 | 上一 fragment 排空后 +2 帧才是下一条 |
 | 直接读 `7s+3s=10s` | 先查 `_delayToBorn`（含变体回退），再减 |
+| 把 `_delayToBorn` 抄进关卡数据 | 它属于**敌人库**（按 enemy id），每关只记录"引用了哪些敌人"；抄进关卡会让同一种敌人出现多份不一致的值 |
+| 拿"血条出现"的帧当出生帧 | 出生帧 = **影子出现**的那一帧（血条/立绘更晚 1~2 帧） |
 | 预览按配置读 count/interval | actionType==1 时客户端强制 `count=2, interval=0.3s` |
 | 隐藏组"留空时间" | 没勾的 action 不存在，后面整体前移 |
 | 把 `randomSpawnGroupKey` 的每条候选都当成会出 | 同组只出抽中的那一条；落选条目不占帧、不影响后面顺延 |
@@ -265,3 +278,31 @@ base = 300000 - 30000 = 270000 mt → 首怪 9s0xf，合成预览 = 270000-90000
 | 波次门 = 上一波离场 + 1 | `wave.maxTimeWaitingForNextWave` | `<_DealWave>d__121` `0x27eb13c` / `0x27eb198` | `artifacts/client-2.7.71/wave-clear-frames.json`；网页"波次门"输入框 | client_static_verified + live_verified（0-2 14/14） |
 | 分支触发帧 | `branches[key].phases[]` | `Scheduler` 分支记录（运行时） | 网页分支选择 + `tools/test_branch_waves.py` | candidate（触发帧是运行时的） |
 | 随机组「同组只出一条」 | `actions[].randomSpawnGroupKey` / `weight` | `RandomGroupSchedulerPreprocessor::DoPreprocess` `0x27f8050`；`PhaseData::FetchActionsWithRandomSpawn` `0x42005cc`（`isValid=0`）；出队 `0x27e9c00` | 网页行标「随机组 g · N 选 1（候选）」，摘要写组数；`tools/test_random_spawn_groups.py`（41 项） | client_static_verified（分组/剔除）/ candidate（`UniformWithWeight` 内部算术与 seed 注入点） |
+
+## 8. 页面读法（2026-09-18 用户口径）
+
+* **没有「主线 / 活动 / 其他」范围下拉**：搜索框永远在全部 3876 关里找，编号、名字、compact（`0001`）
+  都能命中；肉鸽变体（`rogue5_5-2_dlc1` 等）也直接搜得到。
+* **最后一列叫「备注」**（原「标记」）：这一行用到了非零 `_delayToBorn` 时会写 `delayToBorn 1s`；
+  随机刷怪组写成 **`随机组 e1，当前 1/2，概率 1%`**——`当前 x/N` = 这一组现在显示的第几条候选，
+  `概率 p%` = 该候选 `weight ÷ 组内 weight 之和`（客户端抽取用的权重）。**点这个标签会轮换**
+  下一格候选，跨组循环 `e1 → e2 → e3 → e1`，鼠标悬停会提示「点击切换」；轮换用的是 `pinned`
+  口径（服务端 `random_group_pins` / 分发版 JS 的同一套键），所以看到的帧就是「这一格候选被抽中」的帧。
+  轮换回到第 1 格时，时间线必须和刚打开这一关时**逐帧一致**（`tools/test_dist_spawn_timeline.py`
+  的 `random_group_default_matches_client`、本地页 `tools/spawn_times_harness.mjs` 都在看这条）。
+* **随机组的默认口径 = 实机口径**：客户端每组只把**抽中的那一条**排进队列，所以页面默认就是
+  `pinned` 第 0 条（=「当前 1/N」），不是「列出全部候选」。口径选择器里另外两项是**对比用**的：
+  `全部候选` 会把落选条目也排进队列（畸症这种关卡因此会比实机晚 1 帧，**不要**用它读实机时间），
+  `按 randomSeed` 是 candidate 口径（复刻 `System.Random` + `UniformWithWeight`）。
+* **表格列宽/对齐规范**（列宽可拖、窄屏要能横向滚到最后一列）：表头 `.tl-head` 是 grid、事件行是
+  `table.ev-table`（`table-layout:fixed`），两边由 JS 写**同一组像素列宽**；`autoFitColumns()` 量完
+  内容宽后把富余宽度按比例摊回各列，所以表宽 = 容器宽（`table-layout:fixed` 不会再去按比例缩放列宽，
+  这是"表头跟事件列错位 5px 级、越往右越偏"的根因）；内容真的放不下时表比容器宽，
+  `#timeline` 横向滚动，滚到最右能看到最后一列（表头左右 `margin` 必须等于事件表的嵌套内缩
+  20px = wave-box 10+1 加 frag-box 8+1）。
+* **表头可以拖动调列宽**（每列右边缘的把手，双击恢复自适应），**切换关卡时自动按内容重排一次**；
+  侧栏也能拖动调宽、用右侧轨道上的箭头收起/展开（收起后右侧会拿到腾出来的宽度）。
+* **出生帧 = 出现影子的那一帧**：表里的「实际时间」就是这个口径。
+* **敌人 / 内容**列同时显示名字与编号（`源石虫 enemy_1007_slime`），编号与配置 `action.key` 一致。
+* 「来源 · 路线」列已删（用户口径：没用），需要看路线时点行——右侧地图会打点。
+

@@ -107,6 +107,19 @@ autoDisplayEnemyInfo == true → 1 条 DISPLAY_ENEMY_INFO，time = base
 
 所以「同刻的两个条目」会落在**连续两帧**（CE-5 开局三条盾卫实测 0/1/2）。
 
+**ACTIVATE_PREDEFINED（宝箱随机组）到底占几帧：占，而且恰好 1 帧**（2026-09-19 指令级定案）：
+
+* `Scheduler::_DoActivatePredefined`（迭代器工厂 `0x27E7508`）**无条件** new 一个协程对象并返回，
+  没有 key 判空；`<DoActivatePredefined>d__152.MoveNext`（`0x27EF5B4`）**恰好让出一次**；
+  `Scheduler::TryActivePredefined`（`0x27E8A98`）的返回值**没有被读**（`bl` 之后紧跟
+  `ldr x8,[x19,#0x30]`，没有 `cbz/cbnz w0`）。
+* 因此「有 key（`trap_223_dynbox#N`）」与「空 key（不出宝箱）」**都占 1 帧**：随机组的两条候选
+  在帧数上等价，**不存在**「有宝箱 ⇒ 后面所有怪晚 1 帧」。手算时两条候选都按 1 帧算。
+* 真正**不占帧**的是 `EMPTY`：`Scheduler::_RegisterActionExecutors`（`0x27DFCC8`）只注册
+  0..12（`SPAWN`..`SHOW_ALL_HIDDEN_CARDS`）13 个执行器，`EMPTY`(13) 没有执行器，
+  `_ExecuteActionQueue::MoveNext` 按索引取执行器、越界即抛 ⇒ `actions[]` 里是 `null`
+  或类型不认识的条目在**建队时**就被跳过（页面把它们标 `不占帧`）。
+
 **负时间的条目照样占帧**：`autoPreviewRoute` 造出来的预览时间可能是**负数**
 （首条 SPAWN 比 `delayToBorn + 3s` 还早时，例：10-17 首条 SPAWN 3.0s、敌人 delay 1.0s ⇒ 预览 -1.0s）。
 客户端并不丢弃它：第一条的等待量按 `dt <= 0 → 0` 处理，但它**自己那一帧**照算，后面的条目照累计。
@@ -169,9 +182,14 @@ autoDisplayEnemyInfo == true → 1 条 DISPLAY_ENEMY_INFO，time = base
   ⇒ 后面条目不会因为落选者而顺延。
 * 抽取：`BattleController::get_randomImp`（`0x2507170`）+ `IBattleRandom::UniformWithWeight<T>`
   ⇒ 按 `weight` 加权均匀；随机源 `BattleRandomWrapper{ System.Random m_random }`。
-  **具体算术与 `randomSeed` 注入点仍是 candidate**，所以手算时：先按「每组只留一条」
-  把候选删到一条，再照 §2/§3 算；抽中的是哪一条要看实机（页面默认把所有候选都列出来并
-  标「N 选 1（候选）」）。
+  **具体算术与 `randomSeed` 注入点仍是 candidate**。
+* **手算口径 = 页面默认口径 = 实机口径「每组只出第 1 条」**（`pinned`，2026-09-19 用户口径 9/17/24）：
+  同一组的候选只把 `actions[]` 里排在最前的那一条排进队列，其余整条不存在（后面的条目**不会**
+  因为落选者顺延）。备注列里的 `随机组 gN，当前 i/N，概率 p%` 标签点一下切到下一条候选，
+  时间轴会**按新候选重新算**（本地版走 `random_group_pins`，分发版走 JS 核心）。
+* 页面**不显示** `randomSeed`：实机用的不是配置里那个 seed，也不必猜抽中哪条；面板改成
+  **综合概览** = `N 组 / M 条候选` + 「默认每组第 1 条」同时出现的概率（= 各组首条权重之积）。
+* 只想看「全部候选都出」的对照时，页面内部仍保留 `all` 口径（研究用），但**不要**拿它当实机。
 
 例子：`rogue_1-1`（`randomSeed = 455685591`）wave0 f0 有 4 组、每组 2 条（`enemy_1003_ncbow_2`
 权重 75 / `enemy_1011_wizard` 权重 25），所以实际只出 4 只而不是 8 只。
@@ -268,6 +286,8 @@ base = 300000 - 30000 = 270000 mt → 首怪 9s0xf，合成预览 = 270000-90000
    SPAWN 再 `- _delayToBorn`（**变体 id 先剥后缀**）；
    SPAWN/PREVIEW_CURSOR 按 `count`/`interval` 展开；`autoPreviewRoute` 补 2 条 −3s/+0.3s 的预览；
    `autoDisplayEnemyInfo` 补 1 条同刻的 DISPLAY。
+   随机组先按「每组只出第 1 条」删候选（§3.6）；`ACTIVATE_PREDEFINED` 不管有没有 key 都算 1 帧，
+   只有 `EMPTY`（`null` / 不认识的类型）在**建队时**就不进队列。
 4. 整队按时间排序（等键用 Mono 排序语义）。
 5. 逐条排空：`等待 = (t - 上一条已执行 t <= 0) ? 0 : max(1, round(dt))`；`实际帧 = 时钟 + 等待`；
    然后 `时钟 = 实际帧 + 1`。首 fragment 且 `wave.preDelay > 0` 时，最后一条**合成**条目跳过那个 +1。

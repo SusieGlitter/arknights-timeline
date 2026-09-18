@@ -70,8 +70,20 @@ PREVIEW_CURSOR:     time = base + round(interval*30*1000) * n
 ```
 autoPreviewRoute == true  →  2 条 PREVIEW_CURSOR，time = base - 3.0s，再 +0.3s
                              （它们**建在已经减过 delayToBorn 的 base 上**，不继承 key）
-autoDisplayEnemyInfo == true → 1 条 DISPLAY_ENEMY_INFO，time = max(base - delay, 0)
-                             （继承 key，递归时**再减一次** delayToBorn）
+autoDisplayEnemyInfo == true → 1 条 DISPLAY_ENEMY_INFO，time = base
+                             （= 和这条 SPAWN **同一时刻**；delayToBorn 只减一次，2026-09-18 修正）
+```
+
+> **「信息卡」和它的 SPAWN 是同一个时刻**（这条是 2026-09-18 修正的，之前多减了一次 `_delayToBorn`）。
+> 客户端 `Scheduler::_DealAction` 里 `fsub s0, s8, s0`（0x27e3600）**只在 SPAWN 分支**里：
+> `0x27e35a0 cbz w8, #0x27e35cc` 才是 actionType==0；其余类型在 `0x27e35a8 b.ne #0x27e36d4`
+> 走「单条目」路径，`0x27e36e4 str s8, [sp, #0x10]` 直接把已经算好的 `s8` 当条目时间、**不再减**。
+> 合成本身的递归调用把 base 参数置 0（`0x27e37f4 fmov s0, wzr`）、preDelay 设成父层的 `s8`
+> （`0x27e3808 str s8, [x24, #0x24]`），所以新条目时间 = 0 + s8 = s8。
+>
+> 于是实机上「信息卡」总是**比那只怪早 1 帧**（队列 1 帧/条 + 排序）。有 `_delayToBorn` 的怪更是
+> 直接可验证：HE-EX-4（`act26side_ex04`）首条 info 实测 2s00f —— 双减会算成 1s00f，而它对应的
+> 首怪正好是 2s01f。0-1（`delayToBorn = 0`）不受影响，仍是 info 5s04f / 首怪 5s05f。
 ```
 
 ---

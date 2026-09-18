@@ -277,9 +277,12 @@
       var block = truthy(act.blockFragment);
       // `Scheduler::_DealAction`（ARM64 0x27e3600 fsub / 0x27e3604 fmax）：SPAWN 条目按
       // `action.key` 查 `m_enemyMap` 的 `Enemy._delayToBorn`，做 t = max(t - v, 0)。
-      // 合成的 PREVIEW_CURSOR 动作**不继承 key**（客户端 0x27e375c 那段只写 actionType/
-      // count/interval/preDelay/routeIndex），所以它建在已经减过一次的 base 上；
-      // 合成的 DISPLAY_ENEMY_INFO 反而继承 key（0x27e37dc），递归时会再减一次。
+      // 这条 fsub 只落在 **SPAWN 分支**（0x27e35a0 cbz w8,#0x27e35cc）；其余 actionType
+      // 在 0x27e35a8 b.ne #0x27e36d4 走「单条目」路径，0x27e36e4 str s8,[sp,#0x10]
+      // 直接把 s8 当条目时间、**不再减**。合成的 PREVIEW_CURSOR 不继承 key，
+      // 合成的 DISPLAY_ENEMY_INFO 递归时 base 参数=0（0x27e37f4 fmov s0,wzr）+
+      // preDelay=s8（0x27e3808）⇒ 时间 = s8，和它的 SPAWN 同一时刻（2026-09-18 修正：
+      // 曾经在这里又减一次 delayToBorn，HE-EX-4 的 info 因此被算成 1s00f，实机 2s00f）。
       var delay = 0;
       if (atype === 'SPAWN') {
         delay = delayToBornMt(opts.enemy_delay_mt || {}, key);
@@ -306,7 +309,8 @@
           }
         }
         if (truthy(act.autoDisplayEnemyInfo)) {
-          items.push({ time_mt: Math.max(base - delay, 0), action: ai, seq: count + PREVIEW_CURSOR_COUNT,
+          // 只有一次 delayToBorn 减法：base 已经是 max(配置 − delay, 0)，这里**不能再减**。
+          items.push({ time_mt: Math.max(base, 0), action: ai, seq: count + PREVIEW_CURSOR_COUNT,
             kind: 'DISPLAY_ENEMY_INFO', key: key, route: route, synthetic: true,
             use_extra_route: fromBranch, block_fragment: false, hidden_group: group });
         }

@@ -641,18 +641,78 @@ function hslToRgb(hDeg, s, l) {
   var m = l - c / 2;
   return [Math.round((r + m) * 255), Math.round((g + m) * 255), Math.round((b + m) * 255)];
 }
-function markerColor(key) {
-  var h = markerHash(key);
-  var hue = (h % 24) * 15;
-  var sat = (58 + (h >>> 8) % 16) / 100;
-  var light = (33 + (h >>> 16) % 9) / 100;
-  var rgb = hslToRgb(hue, sat, light), r = rgb[0], g = rgb[1], b = rgb[2];
-  var guard = 0;
-  while (relLuminance(r, g, b) > 0.1833 && guard < 12) {
+function rgbCss(rgb) {
+  var r = rgb[0], g = rgb[1], b = rgb[2], guard = 0;
+  while (relLuminance(r, g, b) > 0.1833 && guard < 12) {   // 1.05/(L+0.05) >= 4.5
     r = Math.round(r * 0.92); g = Math.round(g * 0.92); b = Math.round(b * 0.92);
     guard += 1;
   }
   return 'rgb(' + r + ', ' + g + ', ' + b + ')';
+}
+/* 哈希 -> rgb（色相/饱和/亮度都由哈希决定 = "随机生成一个 rgb"）。 */
+function markerColor(key) {
+  var h = markerHash(key);
+  return rgbCss(hslToRgb(h % 360, (52 + (h >>> 8) % 22) / 100, (34 + (h >>> 16) % 12) / 100));
+}
+/* 感知距离（绿通道加权）：判断两个颜色够不够不一样。 */
+function colorDistance(a, b) {
+  var dr = a[0] - b[0], dg = a[1] - b[1], db = a[2] - b[2];
+  return Math.sqrt(2 * dr * dr + 4 * dg * dg + 3 * db * db);
+}
+/* 用户口径 18/20：同一场战斗里出现的颜色必须互异。按 key 排序（确定性、与选择顺序无关），
+   每条以哈希色相起手，沿黄金角找够远的色相，保留「随机生成 rgb」的性质又不撞车。 */
+var MIN_COLOR_DISTANCE = 120;
+function assignColors(keys) {
+  var out = {}, used = [], list = [], seen = {};
+  (keys || []).forEach(function (k) {
+    if (k === null || k === undefined || k === '') return;
+    k = String(k);
+    if (seen[k]) return;
+    seen[k] = 1; list.push(k);
+  });
+  list.sort();
+  list.forEach(function (key) {
+    var h = markerHash(key), best = null, bestScore = -1;
+    for (var step = 0; step < 48; step++) {
+      var hue = (h % 360) + step * 137.508;         // 黄金角
+      var rgb = hslToRgb(hue, (52 + ((h >>> 8) + step) % 26) / 100,
+                         (34 + ((h >>> 16) + step) % 14) / 100);
+      var score = 1e9;
+      if (used.length) { score = 1e9; used.forEach(function (u) { score = Math.min(score, colorDistance(rgb, u)); }); }
+      if (score > bestScore) { bestScore = score; best = rgb; }
+      if (score >= MIN_COLOR_DISTANCE) break;
+    }
+    var rgb2 = best || hslToRgb(h % 360, 0.6, 0.4);
+    used.push(rgb2);
+    out[key] = rgbCss(rgb2);
+  });
+  return out;
+}
+/* 一个关卡里所有需要着色的 key：每个敌人 + 每一对传送门端点。
+   用整关的 key 集合（不是当前选中的行）分配，选择变化时颜色不会跳。 */
+function markerColorMap(data) {
+  if (data && data.__markerColors) return data.__markerColors;
+  var keys = [];
+  var walk = function (rows) { (rows || []).forEach(function (r) { if (r && r.key) keys.push(String(r.key)); }); };
+  walk((data || {}).rows);
+  walk((data || {}).branch_rows);
+  var paths = ((data && data.route_paths) || {});
+  Object.keys(paths).forEach(function (routeKey) {
+    var segs = paths[routeKey];
+    if (!Array.isArray(segs)) return;
+    for (var i = 1; i < segs.length; i++) keys.push('hop:' + routeKey + '#' + (i - 1));
+  });
+  var map = { all: assignColors(keys) };
+  if (data) data.__markerColors = map;
+  return map;
+}
+function markerColorOf(data, key) {
+  var map = markerColorMap(data);
+  return map.all[String(key)] || markerColor(key);
+}
+/* 传送门第 i 对（0 起）：同一对两端同色，不同对互异。 */
+function hopColorOf(data, routeKey, pairIndex) {
+  return markerColorOf(data, 'hop:' + routeKey + '#' + pairIndex);
 }
 
   /*: 地图格子边长（px）：出生点圆直径就是这个值（用户口径：直径 = 格子边长）。
@@ -663,7 +723,8 @@ function markerColor(key) {
     var paths = (data && data.route_paths) || {};
     var key = String(routeKey);
     var idx = key.indexOf(':') >= 0 ? key.split(':')[1] : key;
-    var raw = paths[idx] || paths[key] || null;
+    // 先精确匹配（routes:3 / extraRoutes:0），再退回数字下标（老载荷只有数字键）。
+    var raw = paths[key] || paths[idx] || null;
     if (!raw || !raw.length) return null;
     // 两种形状都要认：`[[r,c], ...]`（一条折线）与 `[[[r,c], ...], ...]`（传送切好的多段）。
     return (typeof raw[0][0] === 'number') ? [raw] : raw;
@@ -674,18 +735,31 @@ function markerColor(key) {
     var map = (data && data.map) || {};
     var rowCount = map.rows || ((map.cells || []).length);
     var cell = MAP_CELL, out = [];
+    var xy = function (p) {
+      return [((Number(p[1]) + 0.5) * cell), ((rowCount - 1 - Number(p[0]) + 0.5) * cell)];
+    };
     segs.forEach(function (seg) {
       if (!seg || seg.length < 2) return;
-      var pts = seg.map(function (p) {
-        var c = Number(p[1]);
-        var r = rowCount - 1 - Number(p[0]);
-        return ((c + 0.5) * cell) + ',' + ((r + 0.5) * cell);
-      }).join(' ');
+      var pts = seg.map(function (p) { return xy(p).join(','); }).join(' ');
       out.push('<polyline points="' + pts + '" fill="none" stroke="' + m.color + '"'
         + ' stroke-width="' + Math.max(3, cell * 0.22) + '" stroke-linecap="round"'
         + ' stroke-linejoin="round" opacity="0.9" data-mk-route="' + esc(m.route_key) + '"'
         + ' data-mk-row="' + esc(String(m.row_index)) + '" class="' + (extraClass || '') + '"></polyline>');
     });
+    // 用户口径 20：传送门的瞬移不画线，两端各留一个同色小点；同一对同色、不同对颜色不同。
+    var radius = Math.max(2.5, cell * 0.14);
+    for (var i = 1; i < segs.length; i++) {
+      var from = segs[i - 1][segs[i - 1].length - 1], to = segs[i][0];
+      var hopColor = hopColorOf(data, m.route_key, i - 1);
+      [from, to].forEach(function (p) {
+        if (!p) return;
+        var pt = xy(p);
+        out.push('<circle class="mk-hop" cx="' + pt[0] + '" cy="' + pt[1] + '" r="' + radius
+          + '" fill="' + hopColor + '" stroke="rgba(0,0,0,.55)" stroke-width="1"'
+          + ' data-mk-route="' + esc(m.route_key) + '" data-mk-row="' + esc(String(m.row_index))
+          + '"><title>传送门端点</title></circle>');
+      });
+    }
     return out.join('');
   }
 
@@ -709,7 +783,7 @@ function markerColor(key) {
       list.push({ r: sr, c: Number(sp.col),
                   label: (spawnNo[index] !== undefined ? String(spawnNo[index]) : '*'),
                   frame: row.actual_frame || 0, spawn: !!row.is_spawn, key: row.key, row_index: index,
-                  route_key: routeKey, color: markerColor(row.key || routeKey),
+                  route_key: routeKey, color: markerColorOf(data, row.key || routeKey),
                   preview: !picked[index] });
     });
     list.sort(function (a, b) { return a.frame - b.frame; });
@@ -883,28 +957,39 @@ function markerColor(key) {
     });
   }
 
-  /* 随机组的摘要：本页只列候选，必须把「同组只出一条」写出来，否则会被读成怪翻倍。 */
+  /* 用户口径 22：随机组的「综合概览」。
+     不写 randomSeed（实机用的不是关卡里那个 seed），也不猜抽中了哪一条；
+     只给组数/候选数 + 默认组合（每组第 1 条）同时出现的概率 = 各组首条权重之积。 */
   function randomGroupSummary(data) {
-    var rg = data && data.random_groups;
-    var counts = (rg && rg.counts) || null;
-    var groups = 0;
-    if (counts && counts.groups) groups = counts.groups;
-    else {
-      // 行上已带 `random_group`（导出载荷自带；本地重算由 applyRandomGroups 打标）
-      var seen = {};
-      (data.rows || []).forEach(function (r) {
-        if (r && r.random_group) seen[r.wave + '.' + r.fragment + '.' + r.random_group] = 1;
-      });
-      groups = Object.keys(seen).length;
-    }
-    if (!groups) return '';
-    var seed = (rg && rg.seed !== null && rg.seed !== undefined) ? '，randomSeed ' + rg.seed : '';
-    return ' <span class="tag candidate" title="同组只出抽中的那一条（PhaseData::FetchActionsWithRandomSpawn 0x42005cc；'
-      + '落选条目 isValid=0，出队侧跳过且不占帧）。抽取算术仍是 candidate，见 spawn-schedule.md §16">随机组 '
-      + groups + ' 组 · ' + ((rg && rg.policy === 'all')
-        ? '已列出全部候选（对比口径）'
-        : (rg && rg.policy === 'seed' ? '按 randomSeed 抽中的一条' : '当前候选（与实机一致：每组只出 1 条）'))
-      + seed + '</span>';
+    var rows = (data.rows || []).concat(data.branch_rows || []);
+    var groups = {}, order = [];
+    rows.forEach(function (r) {
+      if (!r || !r.random_group) return;
+      var key = r.random_group + '@w' + r.wave + '/f' + r.fragment;
+      var weights = Array.isArray(r.random_group_weights) ? r.random_group_weights.map(Number) : null;
+      var size = Number(r.random_group_size || 0) || (weights ? weights.length : 1);
+      if (!groups[key]) { groups[key] = { size: size, weights: weights }; order.push(key); }
+      else if (!groups[key].weights && weights) groups[key].weights = weights;
+    });
+    var n = order.length;
+    if (!n) return '';
+    var candidates = 0, joint = 1, known = true, parts = [];
+    order.forEach(function (key) {
+      var g = groups[key];
+      candidates += g.size;
+      if (g.weights && g.weights.length) {
+        var total = g.weights.reduce(function (a, b) { return a + b; }, 0);
+        var first = total > 0 ? (g.weights[0] || 0) / total : 1;
+        joint *= first;
+        parts.push(key.split('@')[0] + ' ' + (Math.round(first * 1000) / 10) + '%');
+      } else { known = false; }
+    });
+    var pct = joint * 100;
+    var shown = pct >= 10 ? pct.toFixed(0) : pct >= 1 ? pct.toFixed(1) : pct.toFixed(2);
+    return ' · <span class=zero>随机刷怪组 ' + n + ' 组 / ' + candidates + ' 条候选'
+      + '（默认每组第 1 条' + (known ? '，同时出现 ≈ ' + shown + '%' : '') + '）</span>'
+      + (known && n <= 8 ? ' <span class=zero title="' + esc(parts.join('，')) + '">各组 '
+        + parts.join(' / ') + '</span>' : '');
   }
 
   function render() {

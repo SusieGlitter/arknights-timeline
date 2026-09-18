@@ -1,0 +1,11 @@
+口径 9/17/24：随机组标签轮换要真的重算时间轴 + 面板去掉 randomSeed 改综合概览
+
+- 真 bug：`src/core.js` 的 `schedule()` 调 `randomGroupPlan(level, policy, seed)` 时**漏传 pins**，
+  于是页面点备注里的「随机组 …」标签只换了文字、时间轴一动不动（用户口径 9/17）。
+  畸症 e1（奇美拉 1% / EMPTY 99%）现在 1/2 → 2/2 会真的换成没有奇美拉的分支，
+  整圈回到 1/2 与初始逐行一致。
+- 右侧「随机刷怪组」面板不再显示 randomSeed（实机用的不是配置里的 seed），
+  改成综合概览：组数/候选数 + 默认组合（每组第 1 条）同时出现的概率 + 各组百分比。
+- 回归：test_dist_core 新增 `rogue6_b-6#rg-default` / `#rg-empty` 两个 pins 用例（99 关 / 4999 行 0 差异，
+  漏传 pins 时该用例必失败）；test_dist_spawn_timeline 51 项（新增 rowSigChanged/rowSigRestored/
+  panelSeed/panelOverview）；真 Chrome 复核见 docs/01-tracking/progress-report.md 续 35。

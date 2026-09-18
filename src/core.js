@@ -497,9 +497,14 @@
     opts = opts || {};
     var consumption = opts.consumption || 'client_accumulated';
     var enabled = opts.enabled_hidden_groups || null;
-    // 随机刷怪组：页面给 `random_groups = {policy, seed}`；`all` 不删候选（默认口径）。
+    // 随机刷怪组：页面给 `random_groups = {policy, seed, pins}`；`all` 不删候选（默认口径）。
+    // **`pins` 必须传进去**：页面点备注里的「随机组 …」标签轮换候选时，靠的就是
+    // `pins[<group>@w<wave>/f<fragment>] = 候选下标`；漏掉这个参数时 `randomGroupPlan` 永远
+    // 取第 0 条，于是标签文字在轮换、时间轴却一动不动（用户口径 9/17「随机出怪的按钮没有在
+    // 正常工作，切换后存在问题」）。本地页走 Python `/api/spawn-timeline`，服务端有
+    // `random_group_pins`，所以只有分发版本地现算这一条路径会中招。
     var rgOpts = opts.random_groups || null;
-    var rg = rgOpts ? randomGroupPlan(level, rgOpts.policy, rgOpts.seed) : null;
+    var rg = rgOpts ? randomGroupPlan(level, rgOpts.policy, rgOpts.seed, rgOpts.pins) : null;
     var rows = [], completions = [], cursor = 0;
     // 分发行要显示「首怪 配置 X → 实际 Y」（与本地页同一句话），所以这里也把字面配置帧带上。
     var cfg = configTimeline(level);

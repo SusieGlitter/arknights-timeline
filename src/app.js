@@ -223,13 +223,11 @@
   function randomGroupControls(level) {
     var stats = randomGroupStats(level);
     if (!stats.groups) return '<div class=grp><h4>随机刷怪组 randomSpawnGroupKey</h4><div class=none>本关没有随机刷怪组</div></div>';
-    var seed = levelRandomSeed(level);
-    var seedText = (seed === null || seed === undefined || Number(seed) < 0)
-      ? '（本关 randomSeed 为 -1：实机由服务端随机）'
-      : 'randomSeed = ' + Number(seed);
+    // 用户口径 24：**不显示 randomSeed**（实机用的不是配置里那个 seed，也不需要猜抽中哪一条），
+    // 改成「综合概览」——默认每组第 1 条，同时出现概率 = 各组首条权重之积（与摘要行同一段文字）。
     var html = '<div class=grp><h4>随机刷怪组 randomSpawnGroupKey</h4>'
       + '<div class=muted>' + stats.groups + ' 组 / ' + stats.candidates + ' 条候选</div>'
-      + '<div class=zero>' + esc(seedText) + '</div></div>';
+      + '<div>' + randomGroupSummary(level, true) + '</div></div>';
     return html;
   }
   function spawnPointOf(row) {
@@ -988,7 +986,8 @@ function hopColorOf(data, routeKey, pairIndex) {
   /* 用户口径 22：随机组的「综合概览」。
      不写 randomSeed（实机用的不是关卡里那个 seed），也不猜抽中了哪一条；
      只给组数/候选数 + 默认组合（每组第 1 条）同时出现的概率 = 各组首条权重之积。 */
-  function randomGroupSummary(data) {
+  // `compact=true` 给右侧面板用：省略前缀「随机刷怪组 N 组 / M 条候选」（面板上一行已经有）。
+  function randomGroupSummary(data, compact) {
     var rows = (data.rows || []).concat(data.branch_rows || []);
     var groups = {}, order = [];
     rows.forEach(function (r) {
@@ -1014,7 +1013,8 @@ function hopColorOf(data, routeKey, pairIndex) {
     });
     var pct = joint * 100;
     var shown = pct >= 10 ? pct.toFixed(0) : pct >= 1 ? pct.toFixed(1) : pct.toFixed(2);
-    return ' · <span class=zero>随机刷怪组 ' + n + ' 组 / ' + candidates + ' 条候选'
+    var head = compact ? '' : ('随机刷怪组 ' + n + ' 组 / ' + candidates + ' 条候选');
+    return (compact ? '' : ' · ') + '<span class=zero>' + head
       + '（默认每组第 1 条' + (known ? '，同时出现 ≈ ' + shown + '%' : '') + '）</span>'
       + (known && n <= 8 ? ' <span class=zero title="' + esc(parts.join('，')) + '">各组 '
         + parts.join(' / ') + '</span>' : '');

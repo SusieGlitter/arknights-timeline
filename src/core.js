@@ -281,13 +281,21 @@
       var route = Math.trunc(num(act.routeIndex, 0));
       var key = String(val(act.key, '') || '');
       var block = truthy(act.blockFragment);
-      // 空 key 动作不占执行帧（有别名表时一并判「别名是否存在」）。
+      // 空 key 动作的帧成本：**默认占 1 帧**（客户端指令级口径，2026-09-19）。
+      //   1. `Scheduler::_DoActivatePredefined`（0x27E7508）无条件 new 协程对象，没有 key 判空；
+      //   2. `<DoActivatePredefined>d__152.MoveNext`（0x27EF5B4）**无条件**让出一次，
+      //      `TryActivePredefined`（0x27E8A98）的返回值根本没被读；
+      //   3. `SpawnPredefinedInstanceByAlias`（0x251727C）同步建单位，不排队 ⇒ 有 key 也只是
+      //      **同一帧**里多出一个单位；
+      //   4. 出队侧只按 `isValid(+0x5e)` 决定：`isValid==0`（= 随机组没抽中，或没被 rune 启用）
+      //      在同一次 MoveNext 里 `index++` 跳过（0 帧）；`isValid==1` 一律 yield 执行器（1 帧）。
+      //      `PhaseData::FetchActionsWithRandomSpawn`（0x42005CC）复位段只按
+      //      `randomSpawnGroupKey(+0x40)`/`randomSpawnGroupPackKey(+0x48)` 判空置 isValid，
+      //      被抽中的那条随后置 1 ⇒ 空 key 候选被抽中后照样占 1 帧。
+      // 旧口径（空 key 不占帧）把「没宝箱」那一侧算早了 1 帧，正是用户看到的
+      // 「有宝箱 → 所有怪晚一帧」；用户 2026-09-19 要求按代码明鉴 ⇒ 改为 occupy。
       var noFrameReason = null;
       if (atype === 'EMPTY') noFrameReason = 'empty_action';
-      else if (PREDEFINE_ACTIONS.indexOf(atype) >= 0 && !key) {
-        // 「别名存在但关卡表里查不到」没有实测证据 -> 保持旧行为（占 1 帧），见文档 candidate。
-        noFrameReason = 'predefine_alias_empty';
-      }
       // `Scheduler::_DealAction`（ARM64 0x27e3600 fsub / 0x27e3604 fmax）：SPAWN 条目按
       // `action.key` 查 `m_enemyMap` 的 `Enemy._delayToBorn`，做 t = max(t - v, 0)。
       // 这条 fsub 只落在 **SPAWN 分支**（0x27e35a0 cbz w8,#0x27e35cc）；其余 actionType

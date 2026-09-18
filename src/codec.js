@@ -110,6 +110,10 @@
       map: map,
       spawn_points: spawnPoints,
       route_paths: routePaths,
+      /* 锚点兜底的路由键（寻路模型判定不可达 ⇒ 画配置锚点折线，标 candidate）。
+         导出侧是 `c.pf`（tools/export_spawn_timeline_dist.py），与本地版载荷的
+         `route_path_fallbacks` 同语义。 */
+      route_path_fallbacks: (c.pf || []).map(String),
       confidence: 'dist compact payload (tools/export_spawn_timeline_dist.py)',
     };
   }

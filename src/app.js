@@ -388,7 +388,7 @@
       // 用户口径：删掉「来源 / 路线」列后每行必须只剩 5 格（多一格会把最后一列挤出可视区）。
       + '<td><span class=zero>' + where + '</span>'
       + (row.hidden_group ? ' <span class=tag>隐藏组 ' + esc(row.hidden_group) + '</span>' : '')
-      + randomGroupTag(row) + delayToBornTag(row)
+      + randomGroupTag(row) + delayToBornTag(row) + routePathFallbackTag(row)
       // 用户口径 21（实机更正）：空 key / 别名解析不到的条目出队侧被跳过，**不占逻辑帧**。
       + (row.occupies_frame === false
           ? ' <span class="tag candidate" title="空 key / 别名解析不到：出队侧跳过，不占逻辑帧（原因 '
@@ -410,11 +410,17 @@
   function delayToBornTag(row) {
     if (!row || !row.is_spawn || !row.key) return '';
     var table = levelDelayTable();
-    var frames = table ? Number(table[row.key]) : 0;
+    //: `d` 表是**毫帧**（1000 = 1 帧；导出源 enemy-delay-born-global.json 同样是 mt）。
+    //: 2026-09-19：这里以前把 mt 当帧用，1.0 s 的 delayToBorn 在分发版显示成 `1000s`
+    //: （本地版走 Python 的 `enemy_delay_frames`，一直是对的）。
+    function mtToFrames(mt) {
+      return Math.max(0, Math.round(Number(mt || 0) / 1000));
+    }
+    var frames = mtToFrames(table ? table[row.key] : 0);
     if (!frames) {
       // 变体 id（`enemy_2133_shdopl_b`）在导出时已按 base 回退写进表里，这里再兜一层
       var base = String(row.key).replace(/^(.+?)_[a-z]\d*$/, '$1');
-      frames = table ? Number(table[base] || 0) : 0;
+      frames = mtToFrames(table ? table[base] : 0);
     }
     if (!(frames > 0)) return '';
     var seconds = frames / 30;
@@ -423,6 +429,27 @@
       + '值来自独立的敌人库（spawn-waves.js 的 d 表，导出源 enemy-delay-born-global.json）';
     return ' <span class="tag shift" title="' + esc(title) + '">delayToBorn ' + seconds + 's</span>';
   }
+  /* 锚点兜底（寻路模型判定不可达）：这一行的路径是关卡配置的锚点折线，形状对但**不代表
+     客户端真实行走**，与本地版（preview/spawn-times.js:routePathFallbackTag）同口径，
+     标 candidate（2026-09-19：全库 384 条被 SPAWN 引用的 route 此前一条路径都没有）。 */
+  function routePathFallbackKeys(data) {
+    var raw = (data && data.route_path_fallbacks) || [];
+    if (raw instanceof Set) return raw;
+    var set = new Set(raw.map(String));
+    if (data) data.__routeFallbackSet = set;
+    return set;
+  }
+  function routePathFallbackTag(row) {
+    var key = ((row && row.route_source) || 'routes') + ':' + (row ? row.route : '');
+    if (!row) return '';
+    // 本地版载荷会在行上带 `route_path_fallback`；分发版的紧凑行没有这个字段，
+    // 于是按行键到 `route_path_fallbacks`（编码成 `pf`）里查 —— 两条路都要认。
+    if (!row.route_path_fallback && !routePathFallbackKeys(S.data).has(String(key))) return '';
+    return ' <span class="tag candidate" title="寻路模型判定这条路线（' + esc(key)
+      + '）的锚点链在静态地图上不连通（活动/肉鸽关的运行时地块），画出来的是配置锚点折线：'
+      + '形状来自关卡 JSON，不代表客户端真实行走，标 candidate">路径近似</span>';
+  }
+
   function gateRowHtml(gate) {
     var prev = (gate.prev_last_spawn === null || gate.prev_last_spawn === undefined)
       ? '-' : sf(gate.prev_last_spawn);
@@ -764,13 +791,16 @@ function hopColorOf(data, routeKey, pairIndex) {
     var xy = function (p) {
       return [((Number(p[1]) + 0.5) * cell), ((rowCount - 1 - Number(p[0]) + 0.5) * cell)];
     };
+    var fallback = routePathFallbackKeys(data).has(String(m.route_key));
     segs.forEach(function (seg) {
       if (!seg || seg.length < 2) return;
       var pts = seg.map(function (p) { return xy(p).join(','); }).join(' ');
       out.push('<polyline points="' + pts + '" fill="none" stroke="' + m.color + '"'
         + ' stroke-width="' + Math.max(3, cell * 0.22) + '" stroke-linecap="round"'
         + ' stroke-linejoin="round" opacity="0.9" data-mk-route="' + esc(m.route_key) + '"'
-        + ' data-mk-row="' + esc(String(m.row_index)) + '" class="' + (extraClass || '') + '"></polyline>');
+        + ' data-mk-row="' + esc(String(m.row_index)) + '"'
+        + (fallback ? ' data-path-fallback="1" stroke-dasharray="6 5"' : '')
+        + ' class="' + (extraClass || '') + '"></polyline>');
     });
     // 用户口径 20：传送门的瞬移不画线，两端各留一个同色小点；同一对同色、不同对颜色不同。
     var radius = Math.max(2.5, cell * 0.14);
@@ -1529,7 +1559,10 @@ function hopColorOf(data, routeKey, pairIndex) {
     timelineHtml: timelineHtml, matchLevel: matchLevel, prtsLabel: C.prtsLabel,
     randomGroupStats: randomGroupStats, randomGroupIndex: randomGroupIndex,
     levelRandomSeed: levelRandomSeed, rgPairs: rgPairs, rgPinsForCursor: rgPinsForCursor,
-    nextGroupPin: nextGroupPin };
+    nextGroupPin: nextGroupPin,
+    // 行渲染/兜底标签暴露给探针（用户口径 16/19 的「路径近似」断言在分发版上也要能跑）
+    rowHtml: rowHtml, routePathFallbackTag: routePathFallbackTag,
+    routePathFallbackKeys: routePathFallbackKeys };
   // 数据可能是 gzip+base64（见 tools/export_spawn_timeline_dist.py），
   // 那种情况下由页内 bootstrap 解压完再调 boot()。
   if (window.__SPAWN_DATA__) {

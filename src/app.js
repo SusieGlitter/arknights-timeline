@@ -137,7 +137,7 @@
       + '<span class=id>' + esc(base) + ' · 同关 ' + group.length + ' 版</span></div>';
   }
   function renderLevels() {
-    var box = $('list');
+    var box = $('level-list');
     var rows = visibleLevels();
     var html = '', index = 0, chapter = null;
     while (index < rows.length) {
@@ -595,7 +595,7 @@
     return '<div class=tl-head style="width:' + tlSumW() + 'px;grid-template-columns:' + tlColsCss() + '">'
       + '<span>事件<i class=col-resize data-col=0 title="拖动调整列宽，双击恢复自适应"></i></span>'
       + '<span>实际时间<i class=col-resize data-col=1 title="拖动调整列宽，双击恢复自适应"></i></span>'
-      + '<span>出生点(prts.map)<i class=col-resize data-col=2 title="拖动调整列宽，双击恢复自适应"></i></span>'
+      + '<span>出生点<i class=col-resize data-col=2 title="拖动调整列宽，双击恢复自适应"></i></span>'
       + '<span>敌人 / 内容<i class=col-resize data-col=3 title="拖动调整列宽，双击恢复自适应"></i></span>'
       + '<span>备注<i class=col-resize data-col=4 title="拖动调整列宽，双击恢复自适应"></i></span></div>'
       + '<div class=tl-body>' + (body || '<div class=none>没有事件</div>') + '</div>';
@@ -726,16 +726,30 @@
   function render() {
     var data = S.data;
     if (!data) return;
-    $('head').innerHTML = '<div class=title>' + esc(data.level.code + ' · ' + data.level.name)
-      + '</div><div class=path>' + esc(data.level.id + ' · ' + data.level.path) + '</div>';
+    $('level-head').innerHTML = '<div class=title>' + esc(data.level.code + ' · ' + data.level.name)
+      + '</div><div class=path>' + esc(data.level.path) + ' · ' + esc(D.version) + '</div>';
     $('options').innerHTML = optionControls(data);
     var s = data.summary || {};
     var spawns = (data.rows || []).filter(function (r) { return r.is_spawn; });
     var rgSummary = randomGroupSummary(data);
+    // 与本地页 `preview/spawn-times.js:summaryText()` 同一句话（用户口径：分发版要一比一）。
+    var pushed = spawns.filter(function (r) {
+      return r.config_frame !== null && r.config_frame !== undefined && r.actual_frame !== r.config_frame;
+    }).length;
+    var first = spawns[0], last = spawns[spawns.length - 1];
     $('summary').innerHTML = '生成 <b>' + (s.spawns || 0) + '</b> 次'
-      + (spawns.length ? ' · 首怪 ' + sf(spawns[0].actual_frame) + ' · 末怪 ' + sf(spawns[spawns.length - 1].actual_frame) : '')
+      + (first ? ' · 首怪 配置 ' + sf(first.config_frame) + ' → 实际 <b>' + sf(first.actual_frame) + '</b>' : '')
+      + (last ? ' · 末怪 配置 ' + sf(last.config_frame) + ' → 实际 <b>' + sf(last.actual_frame) + '</b>' : '')
+      + ' · 与配置不同的有 ' + pushed + ' 条'
+      + (s.branch_rows ? ' · 分支行 ' + s.branch_rows : '')
+      + (s.skipped_count ? ' · <span class=shift>被隐藏组过滤 ' + s.skipped_count + ' 条</span>' : '')
       + (data.branch_notice ? ' <span class=tag>' + esc(data.branch_notice) + '</span>' : '')
       + rgSummary;
+    var stEl = $('status');
+    if (stEl) {
+      stEl.textContent = '已重算 ' + (data.level.code || data.level.id) + '：' + (s.rows || 0)
+        + ' 条队列条目 / ' + (s.spawns || 0) + ' 次出怪' + (s.skipped_count ? ' / 过滤 ' + s.skipped_count + ' 条' : '');
+    }
     $('timeline').innerHTML = timelineHtml(data);
     bindRowSelection();
     // 用户口径：列宽可拖动，切换关卡时自动按内容适配。
@@ -979,6 +993,9 @@
         key: r.key, enemy_name: KEY_NAME[r.key] || null, wave: r.wave, fragment: r.fragment,
         action: r.action, seq: r.seq, route: r.route, route_source: 'routes',
         ideal_frame: r.ideal_frame, actual_frame: r.actual_frame, synthetic: r.synthetic,
+        // 字面配置帧：摘要行要写「首怪 配置 X → 实际 Y」（与本地页同句），缺它就只剩 `-`。
+        config_frame: (r.config_frame === undefined ? null : r.config_frame),
+        config_frame_source: r.config_frame_source || 'level_config',
         hidden_group: r.hidden_group || null,
         random_group: r.random_group || null, random_group_size: r.random_group_size || null,
         random_group_chosen: r.random_group_chosen || null,

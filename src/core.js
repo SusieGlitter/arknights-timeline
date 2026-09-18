@@ -408,6 +408,56 @@
     return { rows: rows };
   }
 
+  /* 字面配置时间线（Python `spawn_timeline.config_frames` / `config_fragment_cursors` 的 JS 版）：
+     只把 `preDelay` 相加，忽略一切调度推迟/顺延。分发版的摘要行要写「首怪 配置 X → 实际 Y」，
+     与本地页同一句话，所以这里必须有同一份读数。
+     返回 `{frames: "w.f.a.seq" -> 帧, cursors: "w.f" -> 帧}`（合成条目由调用方按父条目推导）。 */
+  function configTimeline(level) {
+    var frames = {}, cursors = {}, cursor = 0;
+    entries(level.waves).forEach(function (wave, wi) {
+      cursor += framesOf(val(wave.preDelay, 0));
+      entries(wave.fragments).forEach(function (frag, fi) {
+        cursors[wi + '.' + fi] = cursor;
+        var base = cursor + framesOf(val(frag.preDelay, 0));
+        entries(frag.actions).forEach(function (act, ai) {
+          if (!act || typeof act !== 'object') return;
+          var atype = actionTypeName(val(act.actionType, 0));
+          var t0 = base + framesOf(val(act.preDelay, 0));
+          var count = Math.trunc(num(val(act.count, 0), 0));
+          var interval = framesOf(val(act.interval, 0));
+          if (MULTI[atype]) {
+            for (var s = 0; s < Math.max(0, count); s++) {
+              frames[wi + '.' + fi + '.' + ai + '.' + s] = Math.round(t0 + interval * s);
+            }
+          } else {
+            frames[wi + '.' + fi + '.' + ai + '.0'] = Math.round(t0);
+          }
+        });
+        cursor = base;
+      });
+    });
+    return { frames: frames, cursors: cursors };
+  }
+  /* 一个字面配置帧：真实条目直接查表；合成条目按 `_DealAction` 的常数从父条目推
+     （DISPLAY = 父条目；PREVIEW = 父条目 - 3s + 0.3s×k，与 Python `config_frame_for` 同式）。 */
+  function configFrameOf(level, cfg, wave, fragment, action, seq, kind, fallback) {
+    var key = wave + '.' + fragment + '.' + action + '.' + seq;
+    if (cfg.frames[key] !== undefined) return cfg.frames[key];
+    var parent = cfg.frames[wave + '.' + fragment + '.' + action + '.0'];
+    if (parent !== undefined) {
+      if (kind === 'DISPLAY_ENEMY_INFO') return parent;
+      if (kind === 'PREVIEW_CURSOR') {
+        var waveObj = entries(level.waves)[wave] || {};
+        var fragObj = entries(waveObj.fragments)[fragment] || {};
+        var actObj = entries(fragObj.actions)[action] || {};
+        var count = Math.trunc(num(val(actObj.count, 0), 0));
+        return parent - framesOf(PREVIEW_CURSOR_PRE_DELAY)
+          + framesOf(PREVIEW_CURSOR_INTERVAL) * (seq - count);
+      }
+    }
+    return fallback;
+  }
+
   function schedule(level, opts) {
     opts = opts || {};
     var consumption = opts.consumption || 'client_accumulated';
@@ -416,6 +466,8 @@
     var rgOpts = opts.random_groups || null;
     var rg = rgOpts ? randomGroupPlan(level, rgOpts.policy, rgOpts.seed) : null;
     var rows = [], completions = [], cursor = 0;
+    // 分发行要显示「首怪 配置 X → 实际 Y」（与本地页同一句话），所以这里也把字面配置帧带上。
+    var cfg = configTimeline(level);
     // 波次门（`<_DealWave>d__121` 的 `WaitWhile(_CheckWaveNotFinish)`）：门是**下界**，
     // 默认值来自离线真值表 `artifacts/client-2.7.71/wave-clear-frames.json`（该波全部敌人
     // 离场帧 + 1），由 build 侧写进 payload 的 wave_gates，页面与对拍都走这里。
@@ -470,7 +522,10 @@
             random_group_size: rgi ? rgi.size : null,
             random_group_chosen: rgi ? rgi.chosen : null,
             random_group_weights: rgi ? rgi.weights : null,
-            time_mt: row.item.time_mt, ideal_frame: row.ideal_frame, actual_frame: row.actual_frame });
+            time_mt: row.item.time_mt, ideal_frame: row.ideal_frame, actual_frame: row.actual_frame,
+            config_frame: configFrameOf(level, cfg, wi, fi, row.item.action, row.item.seq, row.item.kind,
+              (cfg.cursors[wi + '.' + fi] || 0) + mtToFrames(row.item.time_mt)),
+            config_frame_source: 'level_config' });
         });
         if (maxWait > 0 && (completion - waveStart) > framesOf(maxWait)) {
           skippedFragments.push({ fragment: fi, reason: 'maxTimeWaitingForNextWave' });

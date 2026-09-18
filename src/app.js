@@ -370,8 +370,11 @@
     var spKey = sp ? ' data-sp="' + esc((row.route_source || 'routes') + ':' + row.route) + '"' : '';
     var picked = (S.sel && S.sel.has(index)) ? ' sel' : '';
     var pickable = sp ? ' pickable' : '';
+    // `data-key` / `data-track` 与本地版（preview/spawn-times.js）同属性：行级自动化
+    // （无头探针、后续的训练环境）要能只靠 DOM 认出这一行是哪个敌人 / 哪条轨。
     return '<tr class="' + (isSpawn ? 'row-spawn' : 'row-other') + picked + pickable
       + '" data-row="' + index + '" data-frame="' + row.actual_frame + '"'
+      + ' data-key="' + esc(row.key || '') + '" data-track="' + esc(row.track || '') + '"'
       + spKey + '>'
       + '<td class=kind>' + esc(row.kind) + '</td>'
       + '<td><b>' + sf(row.actual_frame) + '</b> <span class=zero>' + row.actual_frame + '</span></td>'
@@ -1206,6 +1209,16 @@ function hopColorOf(data, routeKey, pairIndex) {
                                                    rgkeys: D.rgkeys || [] })
       : JSON.parse(JSON.stringify(encoded || {}));
   }
+  /* 敌人显示名：**本关 `enemyDbRefs[].overwrittenData.name` 优先**（`useDb=false` 的变体 id，
+     例如 `enemy_2133_shdopl_d` = 「空植体(奇美拉)」，全局敌人库里查不到），其次才是库名。
+     覆盖表随关卡下发（`spawn-waves.js` 的 `n`，见 tools/export_spawn_timeline_dist.py）。 */
+  function enemyNameFor(entry, key) {
+    var k = String(key || '');
+    if (!k) return null;
+    if (entry && entry.n && entry.n[k]) return entry.n[k];
+    return KEY_NAME[k] || null;
+  }
+
   /* 出生点 / 地图与隐藏组、随机组都无关，只存在于预计算载荷里；本地重算之前先缓存一份。 */
   function ensureMapCache(level, levelId) {
     var key = levelId || (level && level.id) || 'custom';
@@ -1287,7 +1300,7 @@ function hopColorOf(data, routeKey, pairIndex) {
       enabled_hidden_groups: S.groups });
     var rows = sch.rows.map(function (r) {
       return { track: 'wave', track_rank: 0, kind: r.kind, is_spawn: r.kind === 'SPAWN',
-        key: r.key, enemy_name: KEY_NAME[r.key] || null, wave: r.wave, fragment: r.fragment,
+        key: r.key, enemy_name: enemyNameFor(lvEntry, r.key), wave: r.wave, fragment: r.fragment,
         action: r.action, seq: r.seq, route: r.route, route_source: 'routes',
         ideal_frame: r.ideal_frame, actual_frame: r.actual_frame, synthetic: r.synthetic,
         occupies_frame: (r.no_frame ? false : true), no_frame_reason: r.no_frame_reason || null,
@@ -1314,7 +1327,7 @@ function hopColorOf(data, routeKey, pairIndex) {
         branchRows = bsch.rows.map(function (r) {
           return { track: 'branch', track_rank: 1, branch: r.branch, phase: r.phase,
             kind: r.kind, is_spawn: r.kind === 'SPAWN', key: r.key,
-            enemy_name: KEY_NAME[r.key] || null, wave: null, fragment: null,
+            enemy_name: enemyNameFor(lvEntry, r.key), wave: null, fragment: null,
             action: r.action, seq: r.seq, route: r.route, route_source: 'extraRoutes',
             ideal_frame: r.ideal_frame, actual_frame: r.actual_frame, synthetic: r.synthetic,
         occupies_frame: (r.no_frame ? false : true), no_frame_reason: r.no_frame_reason || null,

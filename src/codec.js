@@ -81,7 +81,8 @@
       (item[1] || []).forEach(function (flat) {
         var seg = [];
         for (var i = 0; i + 1 < flat.length; i += 2) seg.push([flat[i], flat[i + 1]]);
-        if (seg.length >= 2) segs.push(seg);
+        // 单点段保留（口径 19/20）：页面只跳过画线，仍然用它画传送门端点小点。
+        if (seg.length >= 1) segs.push(seg);
       });
       if (segs.length) routePaths[String(item[0])] = segs;
     });

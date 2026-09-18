@@ -1262,7 +1262,10 @@ function hopColorOf(data, routeKey, pairIndex) {
     // 那一份（漏了它右边地图就一根路径都没有 —— 用户报的「我看不到路径了」）。
     MAP_CACHE[key] = { map: decoded.map, spawn_points: decoded.spawn_points,
                        wave_gates: decoded.wave_gates || null,
-                       route_paths: decoded.route_paths || {} };
+                       route_paths: decoded.route_paths || {},
+                       // 锚点兜底键（编码载荷的 `pf`）：与 route_paths 一样与隐藏组/随机组无关，
+                       // 本地现算时必须一起带出来，否则兜底路线在分发版上不画虚线、不标「路径近似」。
+                       route_path_fallbacks: decoded.route_path_fallbacks || [] };
     return MAP_CACHE[key];
   }
   function mapCells(level) {
@@ -1395,7 +1398,8 @@ function hopColorOf(data, routeKey, pairIndex) {
       rows: rows, branch_rows: branchRows, wave_gates: sch.wave_gates || [],
       map: localMap(lv, levelId),
       spawn_points: localSpawnPoints(lv, levelId),
-      route_paths: localRoutePaths(lv, levelId) };
+      route_paths: localRoutePaths(lv, levelId),
+      route_path_fallbacks: localRouteFallbacks(levelId) };
   }
   /* 本地重算也要报「随机刷怪组」块：摘要要写 randomSeed 与口径，行上的标签也要权重。
      形状与 Python payload 一致（counts / groups / chosen_index / weights）。 */
@@ -1431,6 +1435,10 @@ function hopColorOf(data, routeKey, pairIndex) {
   function localRoutePaths(lv, levelId) {
     var cached = MAP_CACHE[levelId];
     return (cached && cached.route_paths) ? cached.route_paths : {};
+  }
+  function localRouteFallbacks(levelId) {
+    var cached = MAP_CACHE[levelId];
+    return (cached && cached.route_path_fallbacks) ? cached.route_path_fallbacks : [];
   }
   function renderMessage(msg) {
     var box = $('timeline');

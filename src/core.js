@@ -428,7 +428,13 @@
       cursor = waveStart;
       var maxWait = num(wave.maxTimeWaitingForNextWave, 0);
       var skippedFragments = [];
+      // `maxTimeWaitingForNextWave` 触发后，**这一波剩下的 fragment 全部不再派发**
+      // （Python `battle_simulator.schedule` 在这里是 `break`）。以前 JS 写成
+      // `forEach` 里的 `return`，只跳过了「记录 completion」，后面的 fragment 照样入队 ——
+      // HE-EX-4（act26side_ex04）因此多出 w0 f2/f3 的 4 行、生成数 34 vs Python 的 24。
+      var waveTruncated = false;
       entries(wave.fragments).forEach(function (frag, fi) {
+        if (waveTruncated) return;
         var processStart = cursor;
         var fragStart = processStart + framesOf(frag.preDelay);
         var built = buildFragmentQueue(frag, {
@@ -468,6 +474,7 @@
         });
         if (maxWait > 0 && (completion - waveStart) > framesOf(maxWait)) {
           skippedFragments.push({ fragment: fi, reason: 'maxTimeWaitingForNextWave' });
+          waveTruncated = true;
           return;
         }
         completions.push({ wave: wi, fragment: fi, start_frame: fragStart,

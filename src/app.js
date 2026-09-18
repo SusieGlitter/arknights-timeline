@@ -831,7 +831,7 @@
       if (notice) payload.branch_notice = notice;
       // 缓存这一关的地图/出生点给本地重算用（见 localMap/localSpawnPoints）。
       MAP_CACHE[S.selected || (S.custom && S.custom.id) || level.id] =
-        { map: payload.map, spawn_points: payload.spawn_points };
+        { map: payload.map, spawn_points: payload.spawn_points, wave_gates: payload.wave_gates || null };
     }
     S.data = applyGates(payload, S.gates || {});
     render();
@@ -906,7 +906,10 @@
     var base = D.payloads[comboKey(key, [], [], 0)] || null;
     if (!base) return null;
     var decoded = decodePayload(base);
-    MAP_CACHE[key] = { map: decoded.map, spawn_points: decoded.spawn_points };
+    // `wave_gates` 一起缓存：本地重算（隐藏组子集 / 随机组口径 / 默认 pinned）必须带上
+    // 同一份波次门真值，否则 wave>=1 的波次会被算早（见 computeLocally 里那段注释）。
+    MAP_CACHE[key] = { map: decoded.map, spawn_points: decoded.spawn_points,
+                       wave_gates: decoded.wave_gates || null };
     return MAP_CACHE[key];
   }
   function mapCells(level) {
@@ -955,8 +958,14 @@
     // 波次门（默认 = 该波全部敌人离场 + 1，来自离线真值表 `wave-clear-frames.json`）：
     // 本地重算必须带上同一个下界，否则 00-02 / 00-04 / 00-11 / 01-05 这几关换隐藏组后
     // 会与默认视图差出整段位移（默认视图走的是导出时已带门的载荷）。
+    // 波次门真值：优先用当前载荷（可能是用户改过门值后的结果），否则用同一关默认载荷里
+    // 缓存下来的那份。**默认口径是 `pinned`，第一次选中关卡时 `S.data` 还不存在**，
+    // 没有这条兜底就会把 wave>=1 的波次整体提前（HE-EX-4 的 wave1 实测差 1839 帧）。
+    var cachedGates = (MAP_CACHE[levelId] || {}).wave_gates || null;
+    var liveGates = (S.data || {}).wave_gates || null;
+    var gateSource = (liveGates && liveGates.length) ? liveGates : (cachedGates || []);
     var gateMap = {};
-    (((S.data || {}).wave_gates) || []).forEach(function (g) {
+    gateSource.forEach(function (g) {
       if (g && g.wave !== undefined && g.frame !== null && g.frame !== undefined && isFinite(Number(g.frame))) {
         gateMap[g.wave] = Number(g.frame);
       }

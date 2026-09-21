@@ -342,6 +342,13 @@ base = 300000 - 30000 = 270000 mt → 首怪 9s0xf，合成预览 = 270000-90000
   `pinned` 第 0 条（=「当前 1/N」），不是「列出全部候选」。口径选择器里另外两项是**对比用**的：
   `全部候选` 会把落选条目也排进队列（畸症这种关卡因此会比实机晚 1 帧，**不要**用它读实机时间），
   `按 randomSeed` 是 candidate 口径（复刻 `System.Random` + `UniformWithWeight`）。
+* **「显示」里有一个「预置动作帧成本」下拉**（本地版与分发版同名控件）：默认 `1 帧` 是客户端指令级
+  口径（`Scheduler::_DoActivatePredefined` 无条件 new 协程 + `<DoActivatePredefined>::MoveNext`
+  无条件让出一次，见 §3.5 与 §4）；`2 帧（有 key）` 是**对照假设**（「有 key 时再多占一帧」），
+  选它会强制本地现算，用来 A/B 验证「有宝箱时所有怪晚一帧」这类观测到底是不是这条规则造成的。
+  `tools/test_dist_core.py` 拿 `01-11`（1 条带 key 的预置动作）与 `06-15`（3 条）把 JS 核心与
+  Python 在两个口径下逐行对拍，`tools/test_dist_spawn_timeline.py` 在真 Chrome 里断言下拉存在、
+  切到 `2 帧` 会真的重算。
 * **表格列宽/对齐规范**（列宽可拖、窄屏要能横向滚到最后一列）：表头 `.tl-head` 是 grid、事件行是
   `table.ev-table`（`table-layout:fixed`），两边由 JS 写**同一组像素列宽**；`autoFitColumns()` 量完
   内容宽后把富余宽度按比例摊回各列，所以表宽 = 容器宽（`table-layout:fixed` 不会再去按比例缩放列宽，

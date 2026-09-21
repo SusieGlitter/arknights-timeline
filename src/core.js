@@ -347,7 +347,17 @@
        再加该条自己那一帧；s16 初值 0.0。
      一条条目占的帧 = WaitForFixedSeconds(本条时间 - 上一条已执行时间)（<= 0 时为 0）
      **加上它自己那一帧**。波次起点的那一帧由 waveStartDelay 处理，这里不再有任何口径开关。 */
-  function drainQueue(items, processStart, consumption, tailOverlap) {
+  /* 预置动作帧成本口径（与 Python `battle_simulator.set_predefine_frame_model` 同义）：
+     `one`（默认，静态证据）= 每条预置动作占 1 帧；`two`（对照假设）= 有 key 时再 +1 帧。
+     只有 `client_accumulated` 分支会叠加，位置与 Python `drain_queue_entries` 的
+     `clock += QUEUE_ENTRY_YIELD_FRAMES + _predefine_extra_frames(item)` 一致。 */
+  function predefineExtraFrames(item, model) {
+    if (model !== 'two') return 0;
+    if (PREDEFINE_ACTIONS.indexOf(String(item.kind)) < 0) return 0;
+    return item.key ? 1 : 0;
+  }
+
+  function drainQueue(items, processStart, consumption, tailOverlap, predefineModel) {
     var rows = [], last = processStart - 1, prev = 0, clock = processStart;
     var stepFreeIndex = -1;
     if (tailOverlap) {
@@ -377,7 +387,8 @@
         if (qi === 0) clock = processStart + waitFrames(item.time_mt);
         else if (delta > 0) clock += waitFrames(delta);
         actual = clock;
-        if (qi !== stepFreeIndex) clock += QUEUE_ENTRY_YIELD_FRAMES;
+        if (qi !== stepFreeIndex) clock += QUEUE_ENTRY_YIELD_FRAMES
+          + predefineExtraFrames(item, predefineModel);
       } else if (consumption === 'client_cumulative' || consumption === 'user_pinned') {
         actual = qi === 0 ? processStart + waitFrames(item.time_mt)
           : last + 1 + waitFrames(item.time_mt - prev);
@@ -419,7 +430,7 @@
         var ph = (phase && typeof phase === 'object') ? phase : {};
         var built = buildFragmentQueue(ph, { enabled_hidden_groups: enabled,
           queue_order: opts.queue_order, enemy_delay_mt: opts.enemy_delay_mt, from_branch: true });
-        var drained = drainQueue(built.items, cursor, consumption);
+        var drained = drainQueue(built.items, cursor, consumption, false, opts.predefine_frame_model);
         var phasePre = framesOf(ph.preDelay);
         var acts = entries(ph.actions);
         drained.rows.forEach(function (row) {
@@ -563,7 +574,7 @@
           enemy_delay_mt: opts.enemy_delay_mt,
           dropped_actions: rg ? rg.drop['w' + wi + '/f' + fi] : null });
         var drained = drainQueue(built.items, processStart, consumption,
-          fi === 0 && tailSyntheticOverlap(wave));
+          fi === 0 && tailSyntheticOverlap(wave), opts.predefine_frame_model);
         var lastActual = drained.last_actual;
         var completion = built.items.length
           ? (consumption === 'client_accumulated' ? lastActual + FRAGMENT_HANDOFF_FRAMES + UNMODELLED_ENTRY_FRAMES * built.items.length

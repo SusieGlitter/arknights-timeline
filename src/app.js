@@ -28,6 +28,8 @@
   function wavesReady() { return !!(window.__SPAWN_WAVES__ && Object.keys(window.__SPAWN_WAVES__).length); }
   var C = window.SpawnCore;
   var S = { levels: D.levels, query: '', selected: null, data: null, groups: [], branches: [],
+            //: ACTIVATE_PREDEFINED 的帧成本口径：null = 跟随导出默认（`one`，静态证据）。
+            predefineFrameModel: null, predefineFrameModels: null, defaultPredefineFrameModel: 'one',
             rgPolicy: 'pinned', rgPins: {}, rgCursor: 0, hoverPreview: null,
             branchTrigger: 0, custom: null, gates: {}, sel: new Set(), selAnchor: null,
             rows: [], spawnNo: {},
@@ -183,6 +185,18 @@
       : '<div class=none>本关没有分支波次</div>';
     html += '</div>';
     html += randomGroupControls(level);
+    // 显示组（与本地版 preview/spawn-times.js 同名控件）：预置动作帧成本 A/B。
+    var models = S.predefineFrameModels || [S.defaultPredefineFrameModel || 'one'];
+    html += '<div class=grp><h4>显示</h4>'
+      + '<label class=chk title="ACTIVATE_PREDEFINED 的帧成本：1 帧 = 每条占一帧（客户端指令级证据）；'
+      + '2 帧 = 有 key 时额外占 1 帧（对照口径）">预置动作帧成本 '
+      + '<select id="predefine-frame-model">'
+      + models.map(function (m) {
+        var on = (S.predefineFrameModel || S.defaultPredefineFrameModel || 'one') === m ? ' selected' : '';
+        return '<option value="' + esc(m) + '"' + on + '>'
+          + (m === 'two' ? '2 帧（有 key）' : '1 帧') + '</option>';
+      }).join('')
+      + '</select></label></div>';
     html += '</div></div>';   // .opt-groups / .opt-cols
     return html;
   }
@@ -1092,6 +1106,13 @@ function hopColorOf(data, routeKey, pairIndex) {
       n.onchange = function () { toggleBranch(n.dataset.branch, n.checked); };
     });
     var trig = $('trigger'); if (trig) trig.onchange = function () { S.branchTrigger = Math.max(0, Number(trig.value) || 0); recompute({}); };
+    // 预置动作帧成本下拉：改了必须立刻重算（预计算载荷是 `one` 口径，
+    // 选 `two` 时强制走本地现算，见 recompute 里的 forcedLocal）。
+    var pfm = $('predefine-frame-model');
+    if (pfm) pfm.onchange = function () {
+      S.predefineFrameModel = pfm.value;
+      recompute({ predefine_frame_model: pfm.value });
+    };
     // 随机刷怪组口径下拉已按用户口径 17 删除：备注列里的「随机组 …」标签点一下轮换即可。
     Array.prototype.forEach.call($('timeline').querySelectorAll('[data-gate]'), function (n) {
       n.onchange = function () {
@@ -1128,14 +1149,21 @@ function hopColorOf(data, routeKey, pairIndex) {
     // 分发版是 gzip+base64：boot() 时 S.data 还不存在（载荷由页内 bootstrap 解压后才到），
     // 所以这里必须容忍 null，不能直接读 S.data.xxx（否则 boot 抛异常、页面只剩错误提示）。
     var prev = S.data || {};
-    var consumption = over.consumption || prev.consumption || 'client_accumulated';
+    var consumption = over.consumption || prev.consumption || (D.models && D.models.default_consumption)
+      || 'client_accumulated';
     var queueOrder = over.queue_order || prev.queue_order || 'mono_qsort';
+    var predefineModel = over.predefine_frame_model || S.predefineFrameModel
+      || prev.predefine_frame_model || (D.models && D.models.default_predefine_frame) || 'one';
+    S.predefineFrameModel = predefineModel;
+    // 预计算载荷是按导出默认（`one`）算的；换成 `two` 必须本地现算，否则下拉框
+    // 看起来在动、时间轴却是旧口径（同类 bug 见随机组 pins）。
+    var forcedLocal = predefineModel !== ((D.models && D.models.default_predefine_frame) || 'one');
     // 预计算载荷是 `all` 口径；选了 `seed` 就必须本地现算（否则页面显示的还是全部候选）。
     // `pinned` 不带 pins = 每一组都取第 0 条候选（= 页面默认口径，与实机一致：
     // 客户端每组只出一条）。以前这里会把 pinned 回退成 all（把落选条目也排进队列），
     // 于是畸症这类关卡默认就比实机晚 1 帧，点标签切回第 1 条也和初始显示不一致。
     var seededRG = (S.rgPolicy === 'seed' || S.rgPolicy === 'pinned');
-    var encoded = (S.custom || seededRG) ? null
+    var encoded = (S.custom || seededRG || forcedLocal) ? null
       : (D.payloads[comboKey(S.selected, S.groups, S.branches, S.branchTrigger)] || null);
     var payload = null;
     var notice = '';
@@ -1150,7 +1178,7 @@ function hopColorOf(data, routeKey, pairIndex) {
     ensureMapCache(level, S.selected);
     if (!encoded) {
       try {
-        payload = computeLocally(level, consumption, queueOrder);
+        payload = computeLocally(level, consumption, queueOrder, predefineModel);
       } catch (e) {
         // 本地重算要 spawn-waves.js；缺它的关卡退回预计算载荷（`all` 口径），
         // 只把口径差异写在提示里，不让整页变成错误页。
@@ -1168,6 +1196,7 @@ function hopColorOf(data, routeKey, pairIndex) {
       payload = decodePayload(encoded);
       payload.consumption = consumption;
       payload.queue_order = queueOrder;
+      payload.predefine_frame_model = predefineModel;
       if (notice) payload.branch_notice = notice;
       // 缓存这一关的地图/出生点给本地重算用（见 localMap/localSpawnPoints）。
       MAP_CACHE[S.selected || (S.custom && S.custom.id) || level.id] =
@@ -1299,7 +1328,7 @@ function hopColorOf(data, routeKey, pairIndex) {
     });
     return out;
   }
-  function computeLocally(level, consumption, queueOrder) {
+  function computeLocally(level, consumption, queueOrder, predefineModel) {
     if (typeof level === 'string') level = levelById(level) || { id: level };
     var lv = rawLevelFor(level);
     if (!lv) {
@@ -1327,6 +1356,7 @@ function hopColorOf(data, routeKey, pairIndex) {
       if (v !== null && v !== undefined && isFinite(Number(v))) gateMap[k] = Number(v);
     });
     var sch = C.schedule(lv, { consumption: consumption, queue_order: queueOrder,
+      predefine_frame_model: predefineModel || 'one',
       enemy_delay_mt: lvEntry.d || null, wave_gates: gateMap,
       wave_clear_frames: lvEntry.g || null,
       random_groups: { policy: S.rgPolicy || 'all', seed: levelRandomSeed(level), pins: S.rgPins || {} },
@@ -1354,6 +1384,7 @@ function hopColorOf(data, routeKey, pairIndex) {
           + '本关没有分支定义（spawn-waves.js 缺 branches），只显示常规波次。';
       } else {
         var bsch = C.scheduleBranches(lv, { consumption: consumption, queue_order: queueOrder,
+      predefine_frame_model: predefineModel || 'one',
             enemy_delay_mt: lvEntry.d || null,
           enabled_hidden_groups: S.groups, branches: S.branches,
           branch_trigger_frame: S.branchTrigger });
@@ -1527,6 +1558,13 @@ function hopColorOf(data, routeKey, pairIndex) {
   function boot() {
     if (!refreshData().levels.length) return;
     if (!window.SpawnCore) return;
+    // 口径开关的候选/默认值来自打包载荷（`models`，与本地版 API 的
+    // `consumption_models` / `predefine_frame_models` 同义）。
+    if (D.models) {
+      S.predefineFrameModels = D.models.predefine_frame || null;
+      S.defaultPredefineFrameModel = D.models.default_predefine_frame || 'one';
+      if (!S.predefineFrameModel) S.predefineFrameModel = S.defaultPredefineFrameModel;
+    }
     bindSidebar();
     $('search').oninput = function () { S.query = $('search').value; renderLevels(); };
     var onlyOpts = $('only-options');

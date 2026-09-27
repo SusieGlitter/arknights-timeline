@@ -113,8 +113,17 @@ autoDisplayEnemyInfo == true → 1 条 DISPLAY_ENEMY_INFO，time = base
   没有 key 判空；`<DoActivatePredefined>d__152.MoveNext`（`0x27EF5B4`）**恰好让出一次**；
   `Scheduler::TryActivePredefined`（`0x27E8A98`）的返回值**没有被读**（`bl` 之后紧跟
   `ldr x8,[x19,#0x30]`，没有 `cbz/cbnz w0`）。
-* 因此「有 key（`trap_223_dynbox#N`）」与「空 key（不出宝箱）」**都占 1 帧**：随机组的两条候选
-  在帧数上等价，**不存在**「有宝箱 ⇒ 后面所有怪晚 1 帧」。手算时两条候选都按 1 帧算。
+* 这里说的是**条目被执行**时的帧成本：进了执行队列的条目每条占 1 帧。
+* **主路径（`waves[].fragments[]`，主线关卡实际走的就是这条）还多一步「删除」**（2026-09-23 第 22 轮指令级闭环）：
+  `RandomGroupSchedulerPreprocessor::DoPreprocess`（`0x27F8050`）把「候选 − winner」当待删清单
+  （`m_actionsToDelete`）入队，抽中**空 key** 时 winner 不从清单里摘掉（`0x27F895C` 跳过
+  `List::Remove`，函数体内唯一那处）⇒ 待删清单 = **整组** ⇒ 该组**一条都不剩（0 帧）**；
+  抽中**有 key** 时只删落选 ⇒ 该组剩 **1 条（1 帧）**。落选者带非空 `randomSpawnGroupPackKey` 时，
+  **同一个 fragment 内**同 pack key 的动作也一起被删（`0x27F8CFC` 的 `RemoveAt`，删除集
+  = 预处理器字段 `+0x30`，每个 `(wave,fragment)` 位置 `Clear` 一次）。
+  ⇒ 手算：**空 key 胜出 = 该组 0 帧；宝箱胜出 = 该组 1 帧**，两者在主线关卡**差 1 帧/组**。
+* 分支路径（`branches[].phases[]`，`FetchActionsWithRandomSpawn` `0x42005CC`）是置位式（`isValid` 门）：
+  被抽中的空 key 候选**照样 1 帧**，宝箱与空 key 差 0 —— 这条**不适用于**主线关卡。
 * 真正**不占帧**的是 `EMPTY`：`Scheduler::_RegisterActionExecutors`（`0x27DFCC8`）只注册
   0..12（`SPAWN`..`SHOW_ALL_HIDDEN_CARDS`）13 个执行器，`EMPTY`(13) 没有执行器，
   `_ExecuteActionQueue::MoveNext` 按索引取执行器、越界即抛 ⇒ `actions[]` 里是 `null`
@@ -177,9 +186,13 @@ autoDisplayEnemyInfo == true → 1 条 DISPLAY_ENEMY_INFO，time = base
 * 分组：`RandomGroupSchedulerPreprocessor::DoPreprocess`（ARM64 `0x27f8050`）只收
   `randomSpawnGroupKey` 非空的 action，按 `(wave, fragment, groupKey)` 分组，候选各自带
   `weight`（= `ActionData.weight`，字段 `+0x58`）。
-* 剔除：`PhaseData::FetchActionsWithRandomSpawn`（`0x42005cc`）把落选的置 `isValid = 0`
-  （字段 `+0x5e`），出队侧 `_ExecuteActionQueue::MoveNext`（`0x27e9c00`）**跳过且不占帧**
-  ⇒ 后面条目不会因为落选者而顺延。
+* 剔除（**两条路径，机制不同**，2026-09-23 第 22 轮切片 A 分清）：
+  * **主路径**（`waves[].fragments[]`，主线关卡）：`DoPreprocess`（`0x27F8050`）**直接从 fragment
+    动作表删条目**（`RemoveAt` `0x27F8BD4` / `0x27F8CFC`）⇒ 落选者压根不进队列；抽中**空 key** 时
+    整组被删 ⇒ 该组 **0 条目 0 帧**；抽中**有 key** ⇒ 该组剩 1 条。
+  * **分支路径**（`branches[].phases[]`）：`PhaseData::FetchActionsWithRandomSpawn`（`0x42005CC`）把落选的置
+    `isValid = 0`（字段 `+0x5e`），出队侧 `_ExecuteActionQueue::MoveNext`（`0x27e9c00`）**跳过且不占帧**。
+  两种机制下**后面的条目都不会因为落选者而顺延**；页面默认口径 = 客户端口径 = `client_delete`。
 * 抽取：`BattleController::get_randomImp`（`0x2507170`）+ `IBattleRandom::UniformWithWeight<T>`
   ⇒ 按 `weight` 加权均匀；随机源 `BattleRandomWrapper{ System.Random m_random }`。
   **具体算术与 `randomSeed` 注入点仍是 candidate**。
@@ -325,7 +338,7 @@ base = 300000 - 30000 = 270000 mt → 首怪 9s0xf，合成预览 = 270000-90000
 | 变体 id 用 base 的该字段 | 同关 `enemyDbRefs` 用 base id | 同一张 `m_enemyMap` 按 `action.key` 查 | 畸症实测 6s/9s；16-3 实测 110 vs 模型 109 | live_verified（2 关）/ candidate（"为什么客户端给变体复用 base"更细的链路） |
 | 波次门 = 上一波离场 + 1 | `wave.maxTimeWaitingForNextWave` | `<_DealWave>d__121` `0x27eb13c` / `0x27eb198` | `artifacts/client-2.7.71/wave-clear-frames.json`；网页"波次门"输入框 | client_static_verified + live_verified（0-2 14/14） |
 | 分支触发帧 | `branches[key].phases[]` | `Scheduler` 分支记录（运行时） | 网页分支选择 + `tools/test_branch_waves.py` | candidate（触发帧是运行时的） |
-| 随机组「同组只出一条」 | `actions[].randomSpawnGroupKey` / `weight` | `RandomGroupSchedulerPreprocessor::DoPreprocess` `0x27f8050`；`PhaseData::FetchActionsWithRandomSpawn` `0x42005cc`（`isValid=0`）；出队 `0x27e9c00` | 网页行标「随机组 g · N 选 1（候选）」，摘要写组数；`tools/test_random_spawn_groups.py`（41 项） | client_static_verified（分组/剔除）/ candidate（`UniformWithWeight` 内部算术与 seed 注入点） |
+| 随机组「同组只出一条」 | `actions[].randomSpawnGroupKey` / `weight` | 主路径：`RandomGroupSchedulerPreprocessor::DoPreprocess` `0x27f8050`（`RemoveAt` `0x27F8BD4`/`0x27F8CFC`，空 key 胜出 ⇒ 整组 0 条目）；分支路径：`PhaseData::FetchActionsWithRandomSpawn` `0x42005cc`（`isValid=0`）；出队 `0x27e9c00` | 网页行标「随机组 g · N 选 1（候选）」，摘要写组数/候选数并标出「空 key 胜出整组不占帧」；`tools/test_random_spawn_groups.py`（41 项）、`tools/test_random_group_pack_delete.py`（19 项） | client_static_verified（分组/剔除）/ client_bundle_verified（主路径删除语义，450 关受影响）/ candidate（`UniformWithWeight` 内部算术与 seed 注入点） |
 
 ## 8. 页面读法（2026-09-18 用户口径）
 
@@ -342,6 +355,12 @@ base = 300000 - 30000 = 270000 mt → 首怪 9s0xf，合成预览 = 270000-90000
   `pinned` 第 0 条（=「当前 1/N」），不是「列出全部候选」。口径选择器里另外两项是**对比用**的：
   `全部候选` 会把落选条目也排进队列（畸症这种关卡因此会比实机晚 1 帧，**不要**用它读实机时间），
   `按 randomSeed` 是 candidate 口径（复刻 `System.Random` + `UniformWithWeight`）。
+  **删组口径（2026-09-23 第 22 轮）**：默认 `client_delete` = 客户端删除语义 —— 抽中空 key 的那一组
+  **整组不占帧**（主线关卡因此比旧口径少 0~7 帧，全库 450 关受影响、最大 `+7.000`）；旧的「落选不占帧、
+  胜者恒 1 帧」口径保留成 `random_group_pack_model=off`（Python 侧 `--random-group-pack-model off`，
+  配合 `--empty-action-model skip`）供 A/B 复现历史读数。摘要里的
+  `随机刷怪组 N 组 / M 条候选（K 组空 key 胜出，整组不占帧）` 就是这条口径的显示；组数/候选数按
+  **关卡计划**统计（被整组删掉的组一行都不在时间轴里，但仍计入 N/M）。
 * **「显示」里有一个「预置动作帧成本」下拉**（本地版与分发版同名控件）：默认 `1 帧` 是客户端指令级
   口径（`Scheduler::_DoActivatePredefined` 无条件 new 协程 + `<DoActivatePredefined>::MoveNext`
   无条件让出一次，见 §3.5 与 §4）；`2 帧（有 key）` 是**对照假设**（「有 key 时再多占一帧」），

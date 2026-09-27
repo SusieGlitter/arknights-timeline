@@ -120,11 +120,20 @@
   // ---------------------------------------------------------------------------
   // 随机刷怪组的抽取：`System.Random`（.NET Knuth 减法）+ `UniformWithWeight`
   //
-  // 客户端 `RandomGroupSchedulerPreprocessor::DoPreprocess`（ARM64 0x27f8050）把带
-  // `randomSpawnGroupKey` 的 action 按 (wave, fragment, key) 分组；`PhaseData::
-  // FetchActionsWithRandomSpawn`（0x42005cc）逐组抽一条、把落选的置 `isValid = 0`
-  // （0x42006f8），出队侧 `_ExecuteActionQueue::MoveNext`（0x27e9c00）跳过 invalid
-  // 条目且**不占帧**。随机源是 `IBattleRandom.UniformWithWeight` + `action.weight`。
+  // **主路径**（`waves[].fragments[]`）：`RandomGroupSchedulerPreprocessor::DoPreprocess`
+  // （ARM64 0x27f8050）把带 `randomSpawnGroupKey` 的 action 按 (wave, fragment, key) 分组，
+  // 逐组抽一条，然后**物理删除**落选条目（`List<ActionData>::RemoveAt` 0x6EDDC18）；
+  // 抽中的那条若 `ActionData.key` 为空（`isEmpty = IsNullOrEmpty(key+0x18)`，0x27F894C）
+  // 则入队池 = 全部候选（0x77B9F0C EnqueueRange）⇒ **整组被删、0 条目**；被删候选的
+  // `randomSpawnGroupPackKey` 记进 `m_actionPacksToDelete(+0x30)`，重建段倒序扫本 fragment
+  // 的 action、packKey 命中即级联 `RemoveAt`（0x27F8CEC → 0x27F8CFC）。`HashSet<string>::Clear`
+  // （0x27F8B88 → 0x6894C5C）在每个 fragment 迭代各执行一次且位于 wave/frag 匹配判定**之前**
+  // ⇒ 级联作用域 = **单个 fragment**。
+  // **分支路径**（`branches[].phases[]`）：`PhaseData::FetchActionsWithRandomSpawn`（0x42005cc）
+  // 是另一套语义 —— 置 `isValid = 0`（0x42006f8）、同 packKey 条目复活保留、空 key 抽中照样
+  // 占 1 帧；出队侧 `_ExecuteActionQueue::MoveNext`（0x27e9c00）跳过 invalid 条目且**不占帧**。
+  // 相位级分支路径在本核心里**未实现**（只走 waves 主路径）。
+  // 随机源是 `IBattleRandom.UniformWithWeight` + `action.weight`。
   //
   // 这里是 tools/dotnet_random.py 的逐行移植（同一个 seed ⇒ 同一个序列），用于分发版
   // 在没有服务端的情况下复现 `seed` 口径；抽取算术本身仍是 candidate。
@@ -183,8 +192,12 @@
   }
 
   /** 一次性把随机刷怪组展开成确定性计划（与 tools/battle_simulator.py:random_spawn_group_plan 同构）。 */
-  function randomGroupPlan(level, policy, seed, pins) {
+  function randomGroupPlan(level, policy, seed, pins, packModel) {
     policy = policy || 'all';
+    // 主路径剔除语义（`DoPreprocess` 0x27f8050，2026-09-23 指令级重读）：
+    //   `client_delete`（默认）= 抽中空 key 的组整组物理删除（0 条目）+ packKey 在本
+    //   fragment 内级联删除；`off` = 旧口径（只删落选候选，对拍用）。
+    packModel = packModel || 'client_delete';
     // `pinned`：页面点备注里的标签轮换候选时用。键与 Python 侧一致，依次探测
     // `"<group>@w<wave>/f<fragment>"` → `"<group>@<wave>/<fragment>"` → `"<group>"`。
     var pinMap = pins || {};
@@ -199,17 +212,25 @@
     }
     var usedSeed = Math.trunc(num(seed !== undefined && seed !== null ? seed : num(level.randomSeed, 0), 0));
     var rng = policy === 'seed' ? new DotNetRandom(usedSeed) : null;
-    var drop = {}, groups = [], counts = { groups: 0, candidates: 0, dropped: 0, selected: 0 };
+    var dropping = policy !== 'all';
+    var deleteModel = packModel === 'client_delete';
+    var drop = {}, dropReasons = {}, groups = [];
+    var counts = { groups: 0, candidates: 0, dropped: 0, selected: 0,
+      empty_winner_groups: 0, pack_cascade_dropped: 0 };
     entries(level.waves).forEach(function (wave, wi) {
       entries(wave.fragments).forEach(function (frag, fi) {
+        var acts = entries(frag.actions);
         var order = [], buckets = {};
-        entries(frag.actions).forEach(function (act, ai) {
+        acts.forEach(function (act, ai) {
           if (!act || typeof act !== 'object') return;
           var key = String(val(act.randomSpawnGroupKey, '') || '');
           if (!key) return;
           if (!buckets[key]) { buckets[key] = []; order.push(key); }
-          buckets[key].push({ action: ai, weight: Math.trunc(num(act.weight, 0)) });
+          buckets[key].push({ action: ai, weight: Math.trunc(num(act.weight, 0)),
+            key_empty: !String(val(act.key, '') || ''),
+            pack_key: String(val(act.randomSpawnGroupPackKey, '') || '') });
         });
+        var droppedHere = {}, reasonsHere = {}, packKeys = {}, cascade = [];
         order.forEach(function (key) {
           var cands = buckets[key];
           var weights = cands.map(function (c) { return c.weight; });
@@ -217,20 +238,58 @@
             : policy === 'pinned' ? pinnedIndex(key, wi, fi) : 0;
           if (!(index >= 0 && index < cands.length)) index = 0;
           counts.groups++; counts.candidates += cands.length; counts.selected++;
-          var dropped = policy === 'all' ? [] : cands.filter(function (c, i) {
-            return i !== index;
-          }).map(function (c) { return c.action; });
+          var emptyWinner = !!(deleteModel && dropping && cands[index].key_empty);
+          var dropped;
+          if (!dropping) dropped = [];
+          else if (emptyWinner) { dropped = cands.map(function (c) { return c.action; }); counts.empty_winner_groups++; }
+          else dropped = cands.filter(function (c, i) { return i !== index; }).map(function (c) { return c.action; });
+          cands.forEach(function (c) {
+            if (dropped.indexOf(c.action) >= 0 && c.pack_key) packKeys[c.pack_key] = true;
+          });
+          dropped.forEach(function (ai) {
+            droppedHere[ai] = true;
+            reasonsHere[ai] = (emptyWinner && ai === cands[index].action)
+              ? 'random_group_empty_winner' : 'random_group_not_chosen';
+          });
           counts.dropped += dropped.length;
           groups.push({ wave: wi, fragment: fi, group: key, candidates: cands.map(function (c) {
             return { action: c.action, weight: c.weight };
           }), chosen: index, chosen_action: cands[index].action, dropped: dropped,
-            chosen_candidate: cands[index] });
-          if (dropped.length) drop['w' + wi + '/f' + fi] = (drop['w' + wi + '/f' + fi] || []).concat(dropped);
+            chosen_candidate: cands[index],
+            chosen_key_empty: !!cands[index].key_empty, empty_winner: emptyWinner,
+            pack_keys: cands.map(function (c) { return c.pack_key; }), policy: policy });
         });
+        // pack 级联：`m_actionPacksToDelete` 只在本 fragment 内累积（每 fragment 一次
+        // `HashSet<string>::Clear`），重建段倒序扫本 fragment 的 action，packKey 命中即删。
+        if (deleteModel && Object.keys(packKeys).length) {
+          acts.forEach(function (act, ai) {
+            if (!act || typeof act !== 'object' || droppedHere[ai]) return;
+            var pack = String(val(act.randomSpawnGroupPackKey, '') || '');
+            if (pack && packKeys[pack]) cascade.push(ai);
+          });
+          cascade.forEach(function (ai) {
+            droppedHere[ai] = true;
+            reasonsHere[ai] = 'random_group_pack_cascade';
+          });
+          counts.pack_cascade_dropped += cascade.length;
+        }
+        var slots = Object.keys(droppedHere);
+        if (slots.length) {
+          var slot = 'w' + wi + '/f' + fi;
+          var idxs = slots.map(function (s) { return Number(s); })
+            .sort(function (a, b) { return a - b; });
+          drop[slot] = idxs;
+          var reasons = {};
+          idxs.forEach(function (ai) { reasons[String(ai)] = reasonsHere[ai]; });
+          dropReasons[slot] = reasons;
+        }
       });
     });
-    return { policy: policy, seed: usedSeed, drop: drop, groups: groups, counts: counts,
-      confidence: 'client_static_verified（分组/剔除、isValid 门、weight 字段）+ candidate（UniformWithWeight 算术、randomSeed 注入点）' };
+    return { policy: policy, pack_model: packModel, seed: usedSeed, drop: drop,
+      drop_reasons: dropReasons, groups: groups, counts: counts,
+      confidence: 'client_static_verified（主路径 RemoveAt 删除语义 / 空 key 整组删除 / packKey 级联 / '
+        + 'fragment 作用域 / 分组键 / 随机源 / weight 字段）+ candidate（UniformWithWeight 算术、'
+        + 'randomSeed 注入点；分支路径相位级随机组未实现）' };
   }
 
   function actionEnabled(act, enabled) {
@@ -244,6 +303,7 @@
     opts = opts || {};
     var enabled = opts.enabled_hidden_groups || null;
     var dropped = opts.dropped_actions || null;
+    var droppedReasons = opts.dropped_reasons || null;
     var aliases = opts.predefine_aliases || null;
     var fromBranch = !!opts.from_branch;
     var fragPre = milliFrames(fragment.preDelay);
@@ -255,9 +315,12 @@
         return;
       }
       if (dropped && dropped.indexOf(ai) >= 0) {
-        // 随机刷怪组里没被抽中的候选：客户端置 `isValid = false`，出队侧直接跳过、不占帧。
-        skipped.push({ action: ai, reason: 'random_group_not_chosen',
-          random_spawn_group_key: val(act.randomSpawnGroupKey, null) });
+        // 主路径随机组被 `RandomGroupSchedulerPreprocessor::DoPreprocess` 删掉的条目
+        // （落选候选 / 抽中空 key 时整组 / packKey 级联）：根本不在入队池里 ⇒ 0 帧。
+        var why = (droppedReasons && droppedReasons[String(ai)]) || 'random_group_not_chosen';
+        skipped.push({ action: ai, reason: why,
+          random_spawn_group_key: val(act.randomSpawnGroupKey, null),
+          removed_by: 'RandomGroupSchedulerPreprocessor::DoPreprocess' });
         return;
       }
       var atype = actionTypeName(act.actionType);
@@ -281,19 +344,17 @@
       var route = Math.trunc(num(act.routeIndex, 0));
       var key = String(val(act.key, '') || '');
       var block = truthy(act.blockFragment);
-      // 空 key 动作的帧成本：**默认占 1 帧**（客户端指令级口径，2026-09-19）。
+      // 空 key 动作的帧成本：**不在随机组里的，占 1 帧**（客户端指令级口径，2026-09-19；
+      // 2026-09-23 复核后仍成立 —— 与随机组无关）：
       //   1. `Scheduler::_DoActivatePredefined`（0x27E7508）无条件 new 协程对象，没有 key 判空；
       //   2. `<DoActivatePredefined>d__152.MoveNext`（0x27EF5B4）**无条件**让出一次，
       //      `TryActivePredefined`（0x27E8A98）的返回值根本没被读；
       //   3. `SpawnPredefinedInstanceByAlias`（0x251727C）同步建单位，不排队 ⇒ 有 key 也只是
       //      **同一帧**里多出一个单位；
-      //   4. 出队侧只按 `isValid(+0x5e)` 决定：`isValid==0`（= 随机组没抽中，或没被 rune 启用）
-      //      在同一次 MoveNext 里 `index++` 跳过（0 帧）；`isValid==1` 一律 yield 执行器（1 帧）。
-      //      `PhaseData::FetchActionsWithRandomSpawn`（0x42005CC）复位段只按
-      //      `randomSpawnGroupKey(+0x40)`/`randomSpawnGroupPackKey(+0x48)` 判空置 isValid，
-      //      被抽中的那条随后置 1 ⇒ 空 key 候选被抽中后照样占 1 帧。
-      // 旧口径（空 key 不占帧）把「没宝箱」那一侧算早了 1 帧，正是用户看到的
-      // 「有宝箱 → 所有怪晚一帧」；用户 2026-09-19 要求按代码明鉴 ⇒ 改为 occupy。
+      //   4. 分支路径出队侧按 `isValid(+0x5e)` 决定：`isValid==0` 同一次 MoveNext 里跳过（0 帧）。
+      // **组内空 key 不在这里判**：主路径 `DoPreprocess`（0x27F8050）抽中空 key 时整组被
+      // `RemoveAt` 删掉（0 条目、0 帧），由 `randomGroupPlan` 的 `drop` 表达；`atype === 'EMPTY'`
+      // 指的是 `actions[]` 里根本不是客户端队列条目的那一类（null / 未知类型）。
       var noFrameReason = null;
       if (atype === 'EMPTY') noFrameReason = 'empty_action';
       // `Scheduler::_DealAction`（ARM64 0x27e3600 fsub / 0x27e3604 fmax）：SPAWN 条目按
@@ -572,7 +633,8 @@
         var built = buildFragmentQueue(frag, {
           enabled_hidden_groups: enabled, queue_order: opts.queue_order,
           enemy_delay_mt: opts.enemy_delay_mt,
-          dropped_actions: rg ? rg.drop['w' + wi + '/f' + fi] : null });
+          dropped_actions: rg ? rg.drop['w' + wi + '/f' + fi] : null,
+          dropped_reasons: rg ? (rg.drop_reasons || {})['w' + wi + '/f' + fi] : null });
         var drained = drainQueue(built.items, processStart, consumption,
           fi === 0 && tailSyntheticOverlap(wave), opts.predefine_frame_model);
         var lastActual = drained.last_actual;

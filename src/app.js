@@ -1034,6 +1034,22 @@ function hopColorOf(data, routeKey, pairIndex) {
   function randomGroupSummary(data, compact) {
     var rows = (data.rows || []).concat(data.branch_rows || []);
     var groups = {}, order = [];
+    // 先用**计划**里的组占位：空 key 胜出时 `DoPreprocess`(0x27F8050) 把整组物理删掉（0 条目 0 帧），
+    // 那些组一行都不会出现在 rows 里，但它们仍是关卡数据里的随机组 —— 概览口径必须与
+    // 右侧面板（`random_groups.counts`）一致，不能悄悄少算一组。
+    var planGroups = ((data.random_groups || {}).groups) || [];
+    planGroups.forEach(function (g) {
+      var key = g.group + '@w' + g.wave + '/f' + g.fragment;
+      if (groups[key]) return;
+      var weights = Array.isArray(g.weights) ? g.weights.map(Number) : null;
+      var cands = Array.isArray(g.candidates) ? g.candidates : [];
+      var drops = Array.isArray(g.dropped) ? g.dropped : [];
+      groups[key] = { size: (cands.length || (weights || []).length), weights: weights,
+        // 整组被删 = 计划里「候选全在删除集里」。**不要**用 `kept`：它是 winner 的 action
+        // 下标（不是数量），winner 恰好是 fragment 第 0 条时会误判成「整组删除」。
+        deleted: g.empty_winner === true || (cands.length > 0 && drops.length >= cands.length) };
+      order.push(key);
+    });
     rows.forEach(function (r) {
       if (!r || !r.random_group) return;
       var key = r.random_group + '@w' + r.wave + '/f' + r.fragment;
@@ -1044,10 +1060,11 @@ function hopColorOf(data, routeKey, pairIndex) {
     });
     var n = order.length;
     if (!n) return '';
-    var candidates = 0, joint = 1, known = true, parts = [];
+    var candidates = 0, joint = 1, known = true, parts = [], deleted = 0;
     order.forEach(function (key) {
       var g = groups[key];
       candidates += g.size;
+      if (g.deleted) deleted += 1;
       if (g.weights && g.weights.length) {
         var total = g.weights.reduce(function (a, b) { return a + b; }, 0);
         var first = total > 0 ? (g.weights[0] || 0) / total : 1;
@@ -1057,7 +1074,8 @@ function hopColorOf(data, routeKey, pairIndex) {
     });
     var pct = joint * 100;
     var shown = pct >= 10 ? pct.toFixed(0) : pct >= 1 ? pct.toFixed(1) : pct.toFixed(2);
-    var head = compact ? '' : ('随机刷怪组 ' + n + ' 组 / ' + candidates + ' 条候选');
+    var head = compact ? '' : ('随机刷怪组 ' + n + ' 组 / ' + candidates + ' 条候选'
+      + (deleted ? ('（' + deleted + ' 组空 key 胜出，整组不占帧）') : ''));
     return (compact ? '' : ' · ') + '<span class=zero>' + head
       + '（默认每组第 1 条' + (known ? '，同时出现 ≈ ' + shown + '%' : '') + '）</span>'
       + (known && n <= 8 ? ' <span class=zero title="' + esc(parts.join('，')) + '">各组 '
@@ -1446,7 +1464,11 @@ function hopColorOf(data, routeKey, pairIndex) {
           weights: g.candidates.map(function (c) { return Number(c.weight || 0); }),
           kept: g.chosen_action, dropped: g.dropped, chosen_index: g.chosen,
           chosen_weight: (g.candidates[g.chosen] || {}).weight, total_weight: total(g),
-          pack_keys: g.candidates.map(function () { return ''; }), policy: plan.policy };
+          // `chosen_key_empty`/`empty_winner`：抽中的那条是不是「不生成任何东西」的空 key，
+          // 以及由此触发的整组删除（`DoPreprocess` 0x27F8050 物理删除口径）。
+          chosen_key_empty: !!g.chosen_key_empty, empty_winner: !!g.empty_winner,
+          pack_keys: (g.pack_keys || g.candidates.map(function () { return ''; })),
+          policy: plan.policy };
       }) };
   }
   /* 地图/出生点与隐藏组无关：自定义文件里有 mapData 就用它，否则复用同一关

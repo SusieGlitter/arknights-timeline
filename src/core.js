@@ -292,6 +292,116 @@
         + 'randomSeed 注入点；分支路径相位级随机组未实现）' };
   }
 
+  /** 分支路径的相位级随机组：`PhaseData::FetchActionsWithRandomSpawn`（0x42005CC）的
+      「`isValid` 置位 + 相位级 packKey 复活」，与 `tools/battle_simulator.py:branch_random_group_plan`
+      同构（2026-09-26 切片 H15 的静态读数，见 docs/02-knowledge/spawn-schedule.md §16g）。
+      作用域 = **单个相位**（`PhaseData` 对象），不是 fragment：每组抽中的那条 `isValid = 1`，
+      落选条目 `isValid = 0` ⇒ 出队侧 `MoveNext`（0x27E9C00）跳过且**不占帧**（等价于没排进队列）；
+      抽中条目的非空 `randomSpawnGroupPackKey` 进相位级集合，`isValid == 0` 但 packKey 命中的条目
+      **复活保留**。`policy = 'all'`（载荷导出默认）下全部候选都排进队列 = 旧的「与 2026-09-23
+      之前逐字段一致」行为；页面默认 `pinned`（不带 pins 时每组取第 0 条）才是客户端真值。
+      ※ 2026-09-28 修：这一支**曾经完全没实现**，于是分发版分支视图把同组两条候选都画成出怪
+      （sandbox1_01 `boss_route1` 2 只），本地页（Python）只画抽中的 1 只 —— 就是 U1-16ag。 */
+  function branchRandomGroupPlan(level, opts) {
+    opts = opts || {};
+    var policy = opts.policy || 'all';
+    var model = opts.model || 'client_resurrect';
+    var pinMap = opts.pins || {};
+    var active = model === 'client_resurrect' && policy !== 'all';
+    var usedSeed = Math.trunc(num(opts.seed !== undefined && opts.seed !== null ? opts.seed
+      : num(level.randomSeed, 0), 0));
+    // 独立随机流：与主路径 `randomGroupPlan` 各自从同一个 seed 起算（Python 侧同构）。
+    var rng = policy === 'seed' ? new DotNetRandom(usedSeed) : null;
+    var all = (level && level.branches) || {};
+    var drop = {}, dropReasons = {}, groups = [];
+    var counts = { groups: 0, candidates: 0, dropped: 0, selected: 0, revived: 0 };
+    function branchOf(name) {
+      if (Array.isArray(all)) {
+        for (var bi = 0; bi < all.length; bi++) {
+          if (String((all[bi] || {}).name || bi) === name) return all[bi];
+        }
+        return null;
+      }
+      return all[name] || null;
+    }
+    (opts.branches || []).map(function (n) { return String(n); }).forEach(function (name) {
+      var branch = branchOf(name);
+      if (!branch || typeof branch !== 'object') return;
+      entries(branch.phases).forEach(function (phase, pi) {
+        var ph = (phase && typeof phase === 'object') ? phase : {};
+        var acts = entries(ph.actions);
+        var order = [], buckets = {};
+        acts.forEach(function (act, ai) {
+          if (!act || typeof act !== 'object') return;
+          var key = String(val(act.randomSpawnGroupKey, '') || '');
+          if (!key) return;
+          if (!buckets[key]) { buckets[key] = []; order.push(key); }
+          buckets[key].push({ action: ai, weight: Math.trunc(num(act.weight, 0)),
+            key_empty: !String(val(act.key, '') || ''),
+            pack_key: String(val(act.randomSpawnGroupPackKey, '') || '') });
+        });
+        if (!order.length) return;
+        var kept = {}, packKeys = {}, groupRows = [], revived = [];
+        order.forEach(function (key) {
+          var cands = buckets[key];
+          var weights = cands.map(function (c) { return c.weight; });
+          var index = policy === 'seed' ? uniformIndexWithWeight(rng, weights) : 0;
+          if (policy === 'pinned') {
+            // 键与 Python 侧一致：`<group>@<branch>/p<phase>` → `<group>@p<phase>` → `<group>`。
+            var probes = [key + '@' + name + '/p' + pi, key + '@p' + pi, key];
+            for (var i = 0; i < probes.length; i++) {
+              if (Object.prototype.hasOwnProperty.call(pinMap, probes[i])) {
+                index = Math.trunc(num(pinMap[probes[i]], 0));
+                break;
+              }
+            }
+          }
+          if (!(index >= 0 && index < cands.length)) index = 0;
+          var chosen = cands[index];
+          counts.groups++; counts.candidates += cands.length; counts.selected++;
+          if (active) {
+            kept[chosen.action] = true;
+            if (chosen.pack_key) packKeys[chosen.pack_key] = true;
+          } else {
+            cands.forEach(function (c) { kept[c.action] = true; });
+          }
+          groupRows.push({ group: key, candidates: cands.map(function (c) { return c.action; }),
+            weights: weights, chosen_index: index, chosen_action: chosen.action,
+            chosen_key_empty: !!chosen.key_empty, chosen_pack_key: chosen.pack_key,
+            pack_keys: cands.map(function (c) { return c.pack_key; }), policy: policy });
+        });
+        if (active && Object.keys(packKeys).length) {
+          // 复活：`0x4200890` 的 `HashSet<string>::Contains` 命中 ⇒ 该条目也保留（占 1 帧）。
+          acts.forEach(function (act, ai) {
+            if (!act || typeof act !== 'object' || kept[ai]) return;
+            if (!String(val(act.randomSpawnGroupKey, '') || '')) return;
+            var pack = String(val(act.randomSpawnGroupPackKey, '') || '');
+            if (pack && packKeys[pack]) { kept[ai] = true; revived.push(ai); counts.revived++; }
+          });
+        }
+        var droppedHere = [], reasonsHere = {};
+        acts.forEach(function (act, ai) {
+          if (!act || typeof act !== 'object' || kept[ai]) return;
+          if (!String(val(act.randomSpawnGroupKey, '') || '')) return;
+          droppedHere.push(ai);
+          reasonsHere[String(ai)] = 'random_group_not_chosen';
+          counts.dropped++;
+        });
+        if (droppedHere.length) {
+          var slot = name + '/p' + pi;
+          drop[slot] = droppedHere;
+          dropReasons[slot] = reasonsHere;
+        }
+        groups.push({ branch: name, phase: pi, groups: groupRows, revived: revived });
+      });
+    });
+    return { policy: policy, model: model, seed: usedSeed, active: active,
+      drop: drop, drop_reasons: dropReasons, groups: groups, counts: counts,
+      confidence: active
+        ? 'client_static_verified（相位级 isValid 置位 / packKey 复活 / 落选跳过不占帧）'
+        : 'legacy（policy=all：全部候选都排进队列，与载荷导出同口径）' };
+  }
+
   function actionEnabled(act, enabled) {
     var group = val(act.hiddenGroup, null);
     if (group === null || group === '' || group === undefined) return true;
@@ -320,7 +430,8 @@
         var why = (droppedReasons && droppedReasons[String(ai)]) || 'random_group_not_chosen';
         skipped.push({ action: ai, reason: why,
           random_spawn_group_key: val(act.randomSpawnGroupKey, null),
-          removed_by: 'RandomGroupSchedulerPreprocessor::DoPreprocess' });
+          removed_by: fromBranch ? 'PhaseData::FetchActionsWithRandomSpawn (isValid=0)'
+            : 'RandomGroupSchedulerPreprocessor::DoPreprocess' });
         return;
       }
       var atype = actionTypeName(act.actionType);
@@ -475,6 +586,12 @@
     var trigger = Math.max(0, Math.trunc(num(opts.branch_trigger_frame, 0)));
     var names = (opts.branches || []).map(function (n) { return String(n); });
     var all = (level && level.branches) || {};
+    // 分支路径的相位级随机组（`PhaseData::FetchActionsWithRandomSpawn`）：页面默认 `pinned`
+    // ⇒ 每组只留抽中的一条，落选条目 0 帧（不排进队列）。漏掉这一步时分支视图会把同组候选
+    // 全部画出怪（U1-16ag：sandbox1_01 勾 boss_route1 → 分发版 40 行 / 本地版 37 行）。
+    var rg = opts.random_groups || null;
+    var rgPlan = rg ? branchRandomGroupPlan(level, { policy: rg.policy, seed: rg.seed,
+      pins: rg.pins, branches: names }) : null;
     var rows = [];
     names.forEach(function (name) {
       var branch = null;
@@ -489,8 +606,11 @@
       var cursor = trigger;
       entries(branch.phases).forEach(function (phase, pi) {
         var ph = (phase && typeof phase === 'object') ? phase : {};
+        var slot = name + '/p' + pi;
         var built = buildFragmentQueue(ph, { enabled_hidden_groups: enabled,
-          queue_order: opts.queue_order, enemy_delay_mt: opts.enemy_delay_mt, from_branch: true });
+          queue_order: opts.queue_order, enemy_delay_mt: opts.enemy_delay_mt, from_branch: true,
+          dropped_actions: (rgPlan && rgPlan.drop[slot]) || null,
+          dropped_reasons: (rgPlan && rgPlan.drop_reasons[slot]) || null });
         var drained = drainQueue(built.items, cursor, consumption, false, opts.predefine_frame_model);
         var phasePre = framesOf(ph.preDelay);
         var acts = entries(ph.actions);
@@ -512,7 +632,9 @@
         if (drained.rows.length) cursor = drained.last_actual + 1;
       });
     });
-    return { rows: rows };
+    return { rows: rows, random_groups: rgPlan ? { policy: rgPlan.policy, model: rgPlan.model,
+      seed: rgPlan.seed, active: rgPlan.active, counts: rgPlan.counts, groups: rgPlan.groups,
+      confidence: rgPlan.confidence } : null };
   }
 
   /* 字面配置时间线（Python `spawn_timeline.config_frames` / `config_fragment_cursors` 的 JS 版）：
@@ -711,7 +833,7 @@
     quickSort: quickSort, orderQueue: orderQueue, buildFragmentQueue: buildFragmentQueue,
     drainQueue: drainQueue, schedule: schedule, scheduleBranches: scheduleBranches,
     DotNetRandom: DotNetRandom, uniformIndexWithWeight: uniformIndexWithWeight,
-    randomGroupPlan: randomGroupPlan,
+    randomGroupPlan: randomGroupPlan, branchRandomGroupPlan: branchRandomGroupPlan,
     prtsLabel: prtsLabel,
     build: function (level, opts) { return schedule(level, opts); }
   };

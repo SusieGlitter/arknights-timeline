@@ -1405,7 +1405,11 @@ function hopColorOf(data, routeKey, pairIndex) {
       predefine_frame_model: predefineModel || 'one',
             enemy_delay_mt: lvEntry.d || null,
           enabled_hidden_groups: S.groups, branches: S.branches,
-          branch_trigger_frame: S.branchTrigger });
+          branch_trigger_frame: S.branchTrigger,
+          // 分支路径也要按同一套随机组口径现算（`pinned` + 当前 pins）。不传这个参数时
+          // core.js 走 `policy=all` ⇒ 同组候选全部出怪，与本地页（Python）差行（U1-16ag）。
+          random_groups: { policy: S.rgPolicy || 'pinned', seed: levelRandomSeed(level),
+            pins: S.rgPins || {} } });
         branchRows = bsch.rows.map(function (r) {
           return { track: 'branch', track_rank: 1, branch: r.branch, phase: r.phase,
             kind: r.kind, is_spawn: r.kind === 'SPAWN', key: r.key,
